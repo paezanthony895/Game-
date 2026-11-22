@@ -1,0 +1,8 @@
+{
+  "name": "Atlas Fútbol Pro",
+  "description": "Videojuego completo de fútbol 2D con selecciones y clubes internacionales, 8 niveles de dificultad incluyendo Ultra Difícil, modos Carrera, Mundial, Ligas, Editor y controles táctiles PWA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
