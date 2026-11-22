@@ -1,0 +1,14 @@
+{
+  "background_color": "#ffffff",
+  "dir": "ltr",
+  "display": "fullscreen",
+  "name": "Atlasfutbolpro.vercel",
+  "orientation": "landscape",
+  "scope": "/",
+  "short_name": "Atlasfutbolpro.vercel",
+  "start_url": "/",
+  "theme_color": "#ffffff",
+  "id": "Superfulvito",
+  "description": "Juegaso",
+  "lang": "es"
+}
