@@ -14,6 +14,8 @@ import {
   Home,
   ShoppingBag,
   Coins,
+  Wifi,
+  Cpu,
 } from 'lucide-react';
 import { getAllTeamsWithCustom, mergeImportedTeamsPatch } from './data/database';
 import { advanceCompetitionRound } from './engine/competitions';
@@ -37,7 +39,9 @@ import { DatabaseBrowser } from './components/DatabaseBrowser';
 import { EditorStudio } from './components/EditorStudio';
 import { StatsAndAchievements } from './components/StatsAndAchievements';
 import { SettingsModal } from './components/SettingsModal';
+import { OnlineMultiplayerModal } from './components/OnlineMultiplayerModal';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
+import { UnityUrpInspectorModal } from './components/UnityUrpInspectorModal';
 
 type AppSection =
   | 'title'
@@ -60,15 +64,43 @@ export default function App() {
   const [activeMatch, setActiveMatch] = useState<LaunchMatchRequest | null>(null);
   const [preselectedHome, setPreselectedHome] = useState<Team | null>(null);
   const [storeModalOpen, setStoreModalOpen] = useState<boolean>(false);
+  const [onlineModalOpen, setOnlineModalOpen] = useState<boolean>(false);
+  const [unityInspectorOpen, setUnityInspectorOpen] = useState<boolean>(false);
   const [preMatchSetup, setPreMatchSetup] = useState<{
     mode: GameMode;
     homeTeam?: Team | null;
     twoPlayer?: boolean;
     trainingDrill?: 'free_play' | 'shooting' | 'passing' | 'dribbling' | 'free_kicks';
   } | null>(null);
+  const [racingTitansToast, setRacingTitansToast] = useState<string | null>(null);
 
   const allTeams = useMemo(() => getAllTeamsWithCustom(save.customTeams), [save.customTeams]);
   const teamsMap = useMemo(() => new Map(allTeams.map((t) => [t.id, t])), [allTeams]);
+
+  // Listen for 7-tap Easter egg unlock on Racing Club's crest
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onRacingTitansUnlock = () => {
+      soundEngine.trigger('titan_activation');
+      setSave((prev) => ({
+        ...prev,
+        settings: {
+          ...prev.settings,
+          match: {
+            ...prev.settings.match,
+            racingTitansUnlocked: true,
+            racingTitansEnabled: true,
+          },
+        },
+      }));
+      setRacingTitansToast('¡Racing Titanes activado! (Desbloqueado al tocar 7 veces el escudo de Racing)');
+      window.setTimeout(() => {
+        setRacingTitansToast(null);
+      }, 5000);
+    };
+    window.addEventListener('atlas:racing-titans-unlock', onRacingTitansUnlock);
+    return () => window.removeEventListener('atlas:racing-titans-unlock', onRacingTitansUnlock);
+  }, []);
 
   // Persist save changes
   useEffect(() => {
@@ -317,6 +349,7 @@ export default function App() {
           initialHomeGoals={activeMatch.initialHomeGoals}
           initialAwayGoals={activeMatch.initialAwayGoals}
           trainingDrill={activeMatch.trainingDrill}
+          onlineSession={activeMatch.onlineSession}
           onMatchFinish={handleMatchFinish}
           onExitMatch={() => {
             setActiveMatch(null);
@@ -371,6 +404,18 @@ export default function App() {
           <div className="flex items-center gap-2.5">
             <button
               type="button"
+              data-testid="btn-open-unity-urp"
+              onClick={() => {
+                soundEngine.playUiClick();
+                setUnityInspectorOpen(true);
+              }}
+              className="inline-flex items-center gap-2 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 px-3 py-2 text-xs font-extrabold text-cyan-200 min-h-[40px] cursor-pointer"
+            >
+              <Cpu className="w-4 h-4 text-cyan-300" />
+              <span>Unity URP 80K · 140×90m</span>
+            </button>
+            <button
+              type="button"
               data-testid="btn-open-store"
               onClick={() => {
                 soundEngine.playUiClick();
@@ -416,12 +461,25 @@ export default function App() {
 
               <button
                 type="button"
+                data-testid="btn-title-online-multiplayer"
+                onClick={() => {
+                  soundEngine.playUiClick();
+                  setOnlineModalOpen(true);
+                }}
+                className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-400 hover:from-cyan-400 hover:to-sky-300 px-5 py-3.5 text-sm font-extrabold text-slate-950 shadow-xl cursor-pointer min-h-[48px] transition-colors"
+              >
+                <Wifi className="w-4 h-4 text-slate-950" />
+                <span>MULTIJUGADOR</span>
+              </button>
+
+              <button
+                type="button"
                 data-testid="btn-title-2p"
                 onClick={() => openPreMatchSetup('quick_match', undefined, true)}
-                className="inline-flex items-center gap-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 px-5 py-3.5 text-sm font-extrabold text-slate-950 shadow-xl cursor-pointer min-h-[48px] transition-colors"
+                className="inline-flex items-center gap-2 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 px-5 py-3.5 text-sm font-extrabold text-cyan-200 shadow-xl cursor-pointer min-h-[48px] transition-colors"
               >
-                <Gamepad2 className="w-4 h-4 text-slate-950" />
-                <span>2 Jugadores (J1 vs J2)</span>
+                <Gamepad2 className="w-4 h-4 text-cyan-300" />
+                <span>2 Jugadores Local</span>
               </button>
 
               <button
@@ -454,6 +512,19 @@ export default function App() {
               >
                 <Gamepad2 className="w-4 h-4 text-emerald-400" />
                 <span>14 Modos de Juego</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="btn-hero-unity-urp"
+                onClick={() => {
+                  soundEngine.playUiClick();
+                  setUnityInspectorOpen(true);
+                }}
+                className="inline-flex items-center gap-2 rounded-xl bg-cyan-950/90 hover:bg-cyan-900 border border-cyan-400/60 px-4 py-3.5 text-sm font-extrabold text-cyan-200 shadow-xl cursor-pointer min-h-[48px] transition-colors"
+              >
+                <Cpu className="w-4 h-4 text-cyan-300" />
+                <span>INGENIERÍA UNITY URP (140×90M · 80K)</span>
               </button>
             </div>
           </div>
@@ -526,6 +597,63 @@ export default function App() {
             isModal={true}
           />
         )}
+        {onlineModalOpen && (
+          <OnlineMultiplayerModal
+            teams={allTeams}
+            defaultTeamId={save.settings.profile.favoriteTeamId || allTeams[0].id}
+            defaultFormationId="4-3-3_standard"
+            onClose={() => setOnlineModalOpen(false)}
+            onLaunchOnlineMatch={(room, assignedSide) => {
+              const hTeam = teamsMap.get(room.host.teamId) ?? allTeams[0];
+              const aTeam =
+                (room.guest?.teamId ? teamsMap.get(room.guest.teamId) : null) ??
+                allTeams[1] ??
+                allTeams[0];
+              setOnlineModalOpen(false);
+              handleLaunchMatch({
+                mode: 'quick_match',
+                homeTeam: { ...hTeam, formationId: room.host.formationId || hTeam.formationId },
+                awayTeam: {
+                  ...aTeam,
+                  formationId: room.guest?.formationId || aTeam.formationId,
+                },
+                userSide: assignedSide,
+                twoPlayerMode: false,
+                onlineSession: {
+                  roomCode: room.code,
+                  side: assignedSide,
+                },
+              });
+            }}
+          />
+        )}
+        {unityInspectorOpen && (
+          <UnityUrpInspectorModal
+            onClose={() => setUnityInspectorOpen(false)}
+            currentTimeOfDay={save.settings.match.timeOfDay}
+            currentQuality={save.settings.visual.quality}
+            onChangeTimeOfDay={(tod) =>
+              setSave((p) => ({
+                ...p,
+                settings: { ...p.settings, match: { ...p.settings.match, timeOfDay: tod } },
+              }))
+            }
+            onChangeQuality={(q) =>
+              setSave((p) => ({
+                ...p,
+                settings: { ...p.settings, visual: { ...p.settings.visual, quality: q } },
+              }))
+            }
+          />
+        )}
+        {racingTitansToast && (
+          <div
+            data-testid="racing-titans-unlock-toast"
+            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-2xl bg-gradient-to-r from-sky-900 via-slate-950 to-sky-900 border-2 border-sky-300 px-5 py-3 text-xs sm:text-sm font-display font-black tracking-wider text-sky-100 shadow-2xl"
+          >
+            <span>⚡ {racingTitansToast}</span>
+          </div>
+        )}
         <OfflineIndicator />
       </div>
     );
@@ -589,6 +717,15 @@ export default function App() {
               <span>{save.store.coins}</span>
             </button>
             <PWAInstallButton compact />
+            <button
+              type="button"
+              data-testid="btn-navbar-online"
+              onClick={() => setOnlineModalOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 px-3 py-2 text-xs font-extrabold text-cyan-300 whitespace-nowrap shrink-0 min-h-[38px] cursor-pointer"
+            >
+              <Wifi className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Multijugador</span>
+            </button>
             <button
               type="button"
               data-testid="btn-navbar-jugar-ya"
@@ -733,6 +870,66 @@ export default function App() {
           onClose={() => setStoreModalOpen(false)}
           isModal={true}
         />
+      )}
+
+      {onlineModalOpen && (
+        <OnlineMultiplayerModal
+          teams={allTeams}
+          defaultTeamId={save.settings.profile.favoriteTeamId || allTeams[0].id}
+          defaultFormationId="4-3-3_standard"
+          onClose={() => setOnlineModalOpen(false)}
+          onLaunchOnlineMatch={(room, assignedSide) => {
+            const hTeam = teamsMap.get(room.host.teamId) ?? allTeams[0];
+            const aTeam =
+              (room.guest?.teamId ? teamsMap.get(room.guest.teamId) : null) ??
+              allTeams[1] ??
+              allTeams[0];
+            setOnlineModalOpen(false);
+            handleLaunchMatch({
+              mode: 'quick_match',
+              homeTeam: { ...hTeam, formationId: room.host.formationId || hTeam.formationId },
+              awayTeam: {
+                ...aTeam,
+                formationId: room.guest?.formationId || aTeam.formationId,
+              },
+              userSide: assignedSide,
+              twoPlayerMode: false,
+              onlineSession: {
+                roomCode: room.code,
+                side: assignedSide,
+              },
+            });
+          }}
+        />
+      )}
+
+      {unityInspectorOpen && (
+        <UnityUrpInspectorModal
+          onClose={() => setUnityInspectorOpen(false)}
+          currentTimeOfDay={save.settings.match.timeOfDay}
+          currentQuality={save.settings.visual.quality}
+          onChangeTimeOfDay={(tod) =>
+            setSave((p) => ({
+              ...p,
+              settings: { ...p.settings, match: { ...p.settings.match, timeOfDay: tod } },
+            }))
+          }
+          onChangeQuality={(q) =>
+            setSave((p) => ({
+              ...p,
+              settings: { ...p.settings, visual: { ...p.settings.visual, quality: q } },
+            }))
+          }
+        />
+      )}
+
+      {racingTitansToast && (
+        <div
+          data-testid="racing-titans-unlock-toast"
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-2xl bg-gradient-to-r from-sky-900 via-slate-950 to-sky-900 border-2 border-sky-300 px-5 py-3 text-xs sm:text-sm font-display font-black tracking-wider text-sky-100 shadow-2xl"
+        >
+          <span>⚡ {racingTitansToast}</span>
+        </div>
       )}
 
       <OfflineIndicator />

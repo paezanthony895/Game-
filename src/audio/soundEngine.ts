@@ -20,6 +20,7 @@ class ProceduralSoundEngine {
   private ambienceFilter: BiquadFilterNode | null = null;
   private ambienceSource: AudioBufferSourceNode | null = null;
   private lastFootstepAt = 0;
+  private lastTitanFootstepAt = 0;
   private lastChantPulseAt = 0;
   private lastWhistleBooAt = 0;
   private commentaryDuckingActive = false;
@@ -535,6 +536,58 @@ class ProceduralSoundEngine {
         gain.gain.exponentialRampToValueAtTime(0.001, now + 1.7);
         src.connect(filter).connect(gain).connect(ctx.destination);
         src.start(now);
+        break;
+      }
+
+      case 'titan_footstep': {
+        if (sfxVol <= 0.01 || now - this.lastTitanFootstepAt < 0.25) return;
+        this.lastTitanFootstepAt = now;
+        // Deep seismic thud + low-frequency ground tremor for giant Racing Titans footsteps
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(76 + Math.random() * 10, now);
+        osc.frequency.exponentialRampToValueAtTime(22, now + 0.19);
+        gain.gain.setValueAtTime(0.46 * sfxVol, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.21);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.22);
+
+        const bufSize = Math.floor(ctx.sampleRate * 0.09);
+        const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+        const data = buf.getChannelData(0);
+        for (let i = 0; i < bufSize; i++) {
+          data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufSize * 0.35));
+        }
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const filter = ctx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = 340;
+        const nGain = ctx.createGain();
+        nGain.gain.value = 0.24 * sfxVol;
+        src.connect(filter).connect(nGain).connect(ctx.destination);
+        src.start(now);
+        break;
+      }
+
+      case 'titan_activation': {
+        if (sfxVol <= 0.01 && crowdVol <= 0.01) return;
+        const vol = Math.max(sfxVol, crowdVol, 0.75);
+        const freqs = [110, 164.81, 220, 329.63];
+        freqs.forEach((f, idx) => {
+          const osc = ctx.createOscillator();
+          const g = ctx.createGain();
+          const t0 = now + idx * 0.05;
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(f, t0);
+          g.gain.setValueAtTime(0.16 * vol, t0);
+          g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.65);
+          osc.connect(g).connect(ctx.destination);
+          osc.start(t0);
+          osc.stop(t0 + 0.68);
+        });
         break;
       }
     }

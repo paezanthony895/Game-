@@ -1,6 +1,11 @@
 import React from 'react';
 import { AUTHENTIC_CLUB_ASSETS } from '../data/authenticAssets';
 import { WORLD_CUP_STARS } from '../data/database';
+import {
+  RACING_TITANS_CONFIG,
+  isRacingTeam,
+  isRacingTitansMasterFlagEnabled,
+} from '../engine/racingTitansEasterEgg';
 import type { Team } from '../types/football';
 
 interface TeamCrestProps {
@@ -8,6 +13,29 @@ interface TeamCrestProps {
   size?: number;
   className?: string;
   showBadgeStatus?: boolean;
+}
+
+let racingCrestTapCount = 0;
+let lastRacingCrestTapMs = 0;
+
+function handleRacingCrestTap(team: Team): void {
+  if (!isRacingTitansMasterFlagEnabled() || !isRacingTeam(team)) return;
+  const now = Date.now();
+  if (now - lastRacingCrestTapMs > 5000) {
+    racingCrestTapCount = 0;
+  }
+  lastRacingCrestTapMs = now;
+  racingCrestTapCount += 1;
+  if (racingCrestTapCount >= RACING_TITANS_CONFIG.UNLOCK_CREST_TAPS_REQUIRED) {
+    racingCrestTapCount = 0;
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('atlas:racing-titans-unlock', {
+          detail: { teamId: team.id },
+        })
+      );
+    }
+  }
 }
 
 function hashCrestId(str: string): number {
@@ -36,11 +64,14 @@ export const TeamCrest: React.FC<TeamCrestProps> = ({
   className = '',
   showBadgeStatus = false,
 }) => {
+  const isRacing = isRacingTeam(team);
   // 1. Imported external official crest URL or Data URI takes priority
   const officialImgUrl = team.logoUrl || team.crestUrl;
   if (officialImgUrl) {
     return (
       <div
+        data-testid={isRacing ? 'racing-club-crest' : undefined}
+        onClick={() => handleRacingCrestTap(team)}
         className={`relative inline-flex items-center justify-center shrink-0 ${className}`}
         style={{ width: size, height: size }}
         title={`${team.name} (Escudo Oficial Importado)`}
@@ -597,7 +628,11 @@ export const TeamCrest: React.FC<TeamCrestProps> = ({
   };
 
   return (
-    <div className={`relative inline-flex items-center justify-center shrink-0 ${className}`}>
+    <div
+      data-testid={isRacing ? 'racing-club-crest' : undefined}
+      onClick={() => handleRacingCrestTap(team)}
+      className={`relative inline-flex items-center justify-center shrink-0 ${className}`}
+    >
       <svg
         width={size}
         height={size}

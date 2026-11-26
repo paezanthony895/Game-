@@ -32,10 +32,17 @@ import {
 import {
   PITCH,
   PHYSICS_TUNING,
+  EASTER_EGG_RACING_TITANS,
+  RACING_TITANS_AI_PROFILE,
+  RACING_TITANS_CONFIG,
   createInitialBall,
+  isRacingTeam,
+  isRacingTitansActiveForTeam,
+  isRacingTitansMasterFlagEnabled,
   resolvePlayerCollisions,
   stepBallPhysics,
   stepPlayerMovement,
+  upgradePlayerToRacingTitan,
   type BallState,
   type MatchPlayerState,
   type PlayerAnimState,
@@ -53,6 +60,7 @@ export type MatchPhase =
   | 'kickoff_ready'
   | 'live'
   | 'set_piece'
+  | 'GOAL_KICK_AIM'
   | 'goal_celebration'
   | 'goal_replay'
   | 'halftime'
@@ -76,7 +84,9 @@ export type SoundTrigger =
   | 'foul_card'
   | 'foul_boo'
   | 'near_miss_gasp'
-  | 'thunder';
+  | 'thunder'
+  | 'titan_footstep'
+  | 'titan_activation';
 
 export type CoachMood = 'idle' | 'instruct' | 'protest' | 'despair' | 'celebrate';
 export type CrowdMood = 'calm' | 'dangerous_play' | 'goal_roar' | 'foul_boos' | 'save_applause';
@@ -125,6 +135,20 @@ export interface FreeKickControlState {
   curve: number;     // -1..1 lateral Magnus spin
   strikeType: StrikeType;
   wallPlayerIds: string[];
+}
+
+export interface GoalKickAimState {
+  active: boolean;
+  team: 'home' | 'away';
+  keeperId: string;
+  keeperName: string;
+  isUserControlled: boolean;
+  isFromHands: boolean;
+  aimAngleRad: number;     // Horizontal angle offset (-1.08 .. +1.08 rad) relative to forward axis
+  elevationSlider: number; // 0.0 (pase raso y corto) .. 1.0 (pelotazo largo y alto)
+  chargePower: number;     // 0.0 .. 1.0 while holding TIRO
+  isChargingShoot: boolean;
+  aiDelayTimer: number;    // Only used when isUserControlled === false (rival AI goalkeeper)
 }
 
 export type SkillMoveType = 'bicicleta' | 'amague' | 'sombrerito';
@@ -389,6 +413,7 @@ export class MatchEngine {
   };
   public advantageState: AdvantageState | null = null;
   public freeKickState: FreeKickControlState | null = null;
+  public goalKickAimState: GoalKickAimState | null = null;
   public particleEvents: PitchParticleEvent[] = [];
 
   public activeUserPlayerId: string | null = null;
@@ -441,6 +466,13 @@ export class MatchEngine {
   private lightningRolledThisMatch = false;
   private lightningWillStrikeThisMatch = false;
   private lightningTargetMinute = 26;
+
+  // Racing Titanes Easter Egg runtime state
+  public homeIsRacingTitans = false;
+  public awayIsRacingTitans = false;
+  public hasActiveRacingTitans = false;
+  public racingTitansBannerTimer = 0;
+  private titanFootstepCooldown = 0;
 
   public userInput: UserInputState = {
     moveX: 0,
@@ -535,6 +567,10 @@ export class MatchEngine {
     this.homeStats.goals = this.homeScore;
     this.awayStats.goals = this.awayScore;
 
+    this.homeIsRacingTitans = isRacingTitansActiveForTeam(this.homeTeam, this.settings);
+    this.awayIsRacingTitans = isRacingTitansActiveForTeam(this.awayTeam, this.settings);
+    this.hasActiveRacingTitans = this.homeIsRacingTitans || this.awayIsRacingTitans;
+
     this.spawnPlayers();
 
     if (this.mode === 'penalties' || this.modeConfig.clockMode === 'shootout_only') {
@@ -549,6 +585,13 @@ export class MatchEngine {
         opponentName: this.awayTeam.name,
         stadiumName: this.homeTeam.stadium.name,
       });
+    }
+
+    if (this.hasActiveRacingTitans) {
+      this.bannerText = RACING_TITANS_CONFIG.ACTIVATION_BANNER_TEXT;
+      this.bannerTimer = 4.8;
+      this.racingTitansBannerTimer = 4.8;
+      this.onSound?.('titan_activation');
     }
   }
 
@@ -591,15 +634,25 @@ export class MatchEngine {
   private spawnPlayers(): void {
     this.players = [];
     const buildSide = (team: Team, side: 'home' | 'away') => {
+      const sideIsTitan =
+        side === 'home' ? this.homeIsRacingTitans : this.awayIsRacingTitans;
+      if (sideIsTitan) {
+        team.players = team.players.map((pl) => upgradePlayerToRacingTitan(pl));
+        team.overall = 100;
+        team.attack = 100;
+        team.midfield = 100;
+        team.defense = 100;
+      }
       const formation = getFormation(side === 'home' ? this.homeFormationId : this.awayFormationId);
       const count = 11;
       for (let i = 0; i < count; i++) {
-        const player = team.players[i] ?? team.players[0];
+        const rawPlayer = team.players[i] ?? team.players[0];
+        const player = sideIsTitan ? upgradePlayerToRacingTitan(rawPlayer) : rawPlayer;
         const slot = formation.slots[i] ?? formation.slots[0];
         const x =
           side === 'home'
-            ? slot.x * PITCH.HALF_X * 1.85
-            : PITCH.LENGTH - slot.x * PITCH.HALF_X * 1.85;
+            ? slot.x * PITCH.HALF_X * 1.92
+            : PITCH.LENGTH - slot.x * PITCH.HALF_X * 1.92;
         const y = slot.y * PITCH.WIDTH;
         this.players.push({
           id: `${side}_${i}_${player.id}`,
@@ -612,7 +665,7 @@ export class MatchEngine {
           vy: 0,
           facing: side === 'home' ? 0 : Math.PI,
           lookTargetAngle: side === 'home' ? 0 : Math.PI,
-          stamina: Math.max(60, player.fitness),
+          stamina: sideIsTitan ? 100 : Math.max(60, player.fitness),
           yellowCards: 0,
           redCard: false,
           injured: false,
@@ -633,6 +686,8 @@ export class MatchEngine {
           aiState: 'COVERING_SPACE',
           callingForBall: false,
           inWall: false,
+          isRacingTitan: sideIsTitan,
+          titanScale: sideIsTitan ? RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE : 1.0,
         });
       }
     };
@@ -1170,6 +1225,12 @@ export class MatchEngine {
         : 1.0;
 
     this.cameraShake = Math.max(0, this.cameraShake - dt * 2.8);
+    if (this.racingTitansBannerTimer > 0) {
+      this.racingTitansBannerTimer = Math.max(0, this.racingTitansBannerTimer - dt);
+    }
+    if (this.titanFootstepCooldown > 0) {
+      this.titanFootstepCooldown = Math.max(0, this.titanFootstepCooldown - dt);
+    }
     if (this.bannerTimer > 0) {
       this.bannerTimer = Math.max(0, this.bannerTimer - dt);
       if (this.bannerTimer === 0) this.bannerText = null;
@@ -1399,6 +1460,11 @@ export class MatchEngine {
       return;
     }
 
+    if (this.phase === 'GOAL_KICK_AIM') {
+      this.stepGoalKickAim(dt);
+      return;
+    }
+
     if (this.phase === 'kickoff_ready' || this.phase === 'set_piece') {
       const setPieceInput =
         this.twoPlayerMode && this.restartTeam === 'away' ? this.userInput2 : this.userInput;
@@ -1436,12 +1502,10 @@ export class MatchEngine {
         return;
       }
 
-      // Si es saque de arco (goal_kick), córner (corner) o lateral (throw_in) y el usuario pulsa pase/tiro/centro antes de que termine el timer, ejecuta de inmediato
+      // Si es córner (corner) o lateral (throw_in) y el usuario pulsa pase/tiro/centro antes de que termine el timer, ejecuta de inmediato
       if (
         this.phase === 'set_piece' &&
-        (this.restartType === 'goal_kick' ||
-          this.restartType === 'corner' ||
-          this.restartType === 'throw_in') &&
+        (this.restartType === 'corner' || this.restartType === 'throw_in') &&
         isRestartTeamUserControlled &&
         (setPieceInput.passPressed ||
           setPieceInput.throughPressed ||
@@ -1493,9 +1557,7 @@ export class MatchEngine {
           }
         } else {
           this.onSound?.('whistle_short');
-          // Ejecutar saque de meta, córner, lateral o tiro libre
           if (
-            this.restartType === 'goal_kick' ||
             this.restartType === 'corner' ||
             this.restartType === 'throw_in' ||
             !isRestartTeamUserControlled
@@ -1896,14 +1958,15 @@ export class MatchEngine {
     const slot = form.slots[p.slotIndex] ?? form.slots[0];
     const baseX =
       p.side === 'home'
-        ? slot.x * PITCH.LENGTH * 0.85
-        : PITCH.LENGTH - slot.x * PITCH.LENGTH * 0.85;
+        ? slot.x * PITCH.LENGTH * 0.90
+        : PITCH.LENGTH - slot.x * PITCH.LENGTH * 0.90;
     const baseY = slot.y * PITCH.WIDTH;
 
     return {
       id: p.id,
       team: p.side,
       role: mapRoleCategory(p.player.position),
+      specificPosition: p.player.position,
       x: p.x,
       y: p.y,
       vx: p.vx,
@@ -1924,21 +1987,28 @@ export class MatchEngine {
   }
 
   private stepUserAndAI(dt: number): void {
-    const profile = getDifficultyProfile(this.difficulty);
+    const baseProfile = getDifficultyProfile(this.difficulty);
+    const masterTitanFlag = isRacingTitansMasterFlagEnabled();
+    const homeProfile =
+      masterTitanFlag && this.homeIsRacingTitans ? RACING_TITANS_AI_PROFILE : baseProfile;
+    const awayProfile =
+      masterTitanFlag && this.awayIsRacingTitans ? RACING_TITANS_AI_PROFILE : baseProfile;
+    const minReactionDelay = Math.min(homeProfile.reactionDelaySec, awayProfile.reactionDelaySec);
+
     const homeTeamDiff = this.homeScore - this.awayScore;
     const effectiveHomeTactic =
       this.userSide === 'home'
         ? this.homeTactic
-        : chooseAdaptiveTactic(this.homeTactic, homeTeamDiff, this.matchMinute, profile);
+        : chooseAdaptiveTactic(this.homeTactic, homeTeamDiff, this.matchMinute, homeProfile);
     const effectiveAwayTactic =
       this.userSide === 'away' || this.twoPlayerMode
         ? this.awayTactic
-        : chooseAdaptiveTactic(this.awayTactic, -homeTeamDiff, this.matchMinute, profile);
+        : chooseAdaptiveTactic(this.awayTactic, -homeTeamDiff, this.matchMinute, awayProfile);
 
     this.aiTimer -= dt;
     const refreshAI = this.aiTimer <= 0;
     if (refreshAI) {
-      this.aiTimer = profile.reactionDelaySec;
+      this.aiTimer = minReactionDelay;
     }
 
     if (this.userInput.switchPressed) {
@@ -1981,7 +2051,7 @@ export class MatchEngine {
         ballInfo,
         homeTeamDiff,
         this.matchMinute,
-        profile
+        homeProfile
       );
       this.awayBrainState = evaluateTeamBrain(
         'away',
@@ -1990,7 +2060,7 @@ export class MatchEngine {
         ballInfo,
         -homeTeamDiff,
         this.matchMinute,
-        profile
+        awayProfile
       );
     }
 
@@ -1999,17 +2069,24 @@ export class MatchEngine {
 
     for (const p of this.players) {
       if (p.redCard) continue;
+      const isTitan = Boolean(masterTitanFlag && p.isRacingTitan);
+      if (isTitan) {
+        p.stamina = 100;
+        p.injured = false;
+      }
 
+      const profile = p.side === 'home' ? homeProfile : awayProfile;
       const isUser1Controlled = p.id === this.activeUserPlayerId && this.userSide === p.side;
       const isUser2Controlled =
         this.twoPlayerMode && p.side === 'away' && p.id === this.activeUser2PlayerId;
       const isUserControlled = isUser1Controlled || isUser2Controlled;
       const hasBall = this.ball.ownerId === p.id;
 
-      // Multiplicador de velocidad en partido: ritmo ágil (1.24x base) + ventaja de IA en dificultades altas
+      // Multiplicador de velocidad en partido: ritmo ágil (1.24x base) + ventaja de IA en dificultades altas / Racing Titanes
       const isRivalAI =
         p.side !== this.userSide && !(this.twoPlayerMode && p.side === 'away');
-      const speedMult = baseLivePaceBoost * (isRivalAI ? profile.aiSpeedMultiplier : 1.0);
+      const speedMult =
+        baseLivePaceBoost * (isRivalAI || (isTitan && !isUserControlled) ? profile.aiSpeedMultiplier : 1.0);
 
       // Si el jugador está barriéndose en este momento (solo cuando el usuario presionó el botón de barrer), evaluar robo continuo
       if (p.slideTimer > 0.04) {
@@ -2110,34 +2187,10 @@ export class MatchEngine {
         );
 
         if (hasBall) {
-          // El portero retiene brevemente mientras ambos equipos suben hacia mitad de cancha y luego distribuye solo
-          if (p.aiHoldTimer && p.aiHoldTimer > 0) {
-            p.aiHoldTimer = Math.max(0, p.aiHoldTimer - dt);
-            p.gkAction = 'idle';
-            continue;
-          }
-          p.gkAction = 'distribute';
-          let bestReceiver: AIPlayerNode | null = null;
-          let bestRecScore = -Infinity;
-          const dir = p.side === 'home' ? 1 : -1;
-          for (const m of myTeamNodes) {
-            if (m.role === 'GK') continue;
-            const distFromGk = Math.hypot(m.x - p.x, m.y - p.y);
-            if (distFromGk < 14 || distFromGk > 62) continue;
-            let nearestOppToMate = Infinity;
-            for (const o of oppTeamNodes) {
-              const od = Math.hypot(o.x - m.x, o.y - m.y);
-              if (od < nearestOppToMate) nearestOppToMate = od;
-            }
-            const score = nearestOppToMate * 2.8 + (m.x - p.x) * dir * 0.55;
-            if (score > bestRecScore) {
-              bestRecScore = score;
-              bestReceiver = m;
-            }
-          }
-          const tx = bestReceiver ? bestReceiver.x : PITCH.HALF_X;
-          const ty = bestReceiver ? bestReceiver.y : PITCH.HALF_Y;
-          this.performPass(p, tx, ty, false, 0.85);
+          // Cuando el arquero controla el balón en las manos o en el área, entra en el estado GOAL_KICK_AIM
+          // sin patear ni pasar automáticamente por temporizador para el usuario.
+          this.enterGoalKickAim(p, true);
+          return;
         }
         continue;
       }
@@ -2287,17 +2340,26 @@ export class MatchEngine {
           p.slideTimer <= 0
         ) {
           const distToCarrier = Math.hypot(owner.x - p.x, owner.y - p.y);
-          const tackleReach = isRivalAI && profile.level >= 7 ? 1.92 : 1.65;
+          const tackleReach = isTitan
+            ? 2.85
+            : isRivalAI && profile.level >= 7
+            ? 1.92
+            : 1.65;
           if (distToCarrier < tackleReach) {
             const tackleTriggerChance =
-              isRivalAI && profile.level >= 7
-                ? 0.88
+              isTitan || (isRivalAI && profile.level >= 7)
+                ? 0.92
                 : 0.24 + profile.pressingIntensity * 0.38;
             if (this.rng() < tackleTriggerChance || userPressOverride) {
               this.initiateStandingTackle(p, owner);
             }
           }
         }
+      }
+
+      // Sonido de pisadas fuertes y pequeña vibración de cámara cuando los Titanes de Racing corren
+      if (isTitan && Math.hypot(p.vx, p.vy) > 2.8) {
+        this.triggerTitanFootstepTremor(p, hasBall);
       }
     }
 
@@ -2461,7 +2523,9 @@ export class MatchEngine {
     }
 
     const speed = Math.hypot(p.vx, p.vy);
-    if (speed > 3.6) {
+    if (speed > 2.8 && p.isRacingTitan && isRacingTitansMasterFlagEnabled()) {
+      this.triggerTitanFootstepTremor(p, true);
+    } else if (speed > 3.6) {
       this.onSound?.('footstep_grass');
       if (input.sprint && this.rng() < 0.32) {
         this.emitParticles(p.x, p.y, 0.02, 2, 'turf');
@@ -2743,8 +2807,15 @@ export class MatchEngine {
 
     const isRivalAI =
       passer.side !== this.userSide && !(this.twoPlayerMode && passer.side === 'away');
-    const profile = getDifficultyProfile(this.difficulty);
-    const errorScale = isRivalAI ? Math.min(1.0, profile.passErrorMeters / 3.0) : 0.35;
+    const isTitanPasser = Boolean(isRacingTitansMasterFlagEnabled() && passer.isRacingTitan);
+    const profile = isTitanPasser
+      ? RACING_TITANS_AI_PROFILE
+      : getDifficultyProfile(this.difficulty);
+    const errorScale = isTitanPasser
+      ? 0
+      : isRivalAI
+      ? Math.min(1.0, profile.passErrorMeters / 3.0)
+      : 0.35;
     const maxSpreadMeters = ((1 - passSkill) * 1.9 + pressurePenalty + bodyPenalty + fatiguePenalty) * errorScale;
 
     const finalTargetX = Math.max(1.5, Math.min(PITCH.LENGTH - 1.5, targetX + (this.rng() - 0.5) * maxSpreadMeters));
@@ -2806,7 +2877,14 @@ export class MatchEngine {
       const od = Math.hypot(o.x - shooter.x, o.y - shooter.y);
       if (od < nearestDefDist) nearestDefDist = od;
     }
-    const pressurePenalty = nearestDefDist < 1.85 ? (1.85 - nearestDefDist) * 0.65 : 0;
+    const pressurePenalty = nearestDefDist < 2.65 ? (2.65 - nearestDefDist) * 0.78 : 0;
+
+    // Penalización realista por distancia al arco y ángulo cerrado de tiro
+    const distToGoal = Math.hypot(goalX - shooter.x, PITCH.HALF_Y - shooter.y);
+    const distancePenalty = distToGoal > 16.5 ? Math.min(2.6, (distToGoal - 16.5) * 0.115) : 0;
+    const lateralAngleRatio = Math.min(1, Math.abs(shooter.y - PITCH.HALF_Y) / (PITCH.HALF_Y * 0.85));
+    const narrowAnglePenalty =
+      distToGoal < 16 && lateralAngleRatio > 0.42 ? (lateralAngleRatio - 0.42) * 1.85 : 0;
 
     const isHeader = this.ball.z > 1.18;
     const isVolley = !isHeader && this.ball.z > 0.32;
@@ -2814,7 +2892,7 @@ export class MatchEngine {
     const bodyToGoalAngle = Math.abs(
       Math.atan2(Math.sin(goalAngle - shooter.facing), Math.cos(goalAngle - shooter.facing))
     );
-    const bodyAnglePenalty = bodyToGoalAngle > 1.25 ? (bodyToGoalAngle - 1.25) * 0.55 : 0;
+    const bodyAnglePenalty = bodyToGoalAngle > 0.75 ? (bodyToGoalAngle - 0.75) * 0.82 : 0;
     const isChilena = isVolley && this.ball.z > 0.78 && bodyToGoalAngle > 1.15;
     const isRabona =
       !isHeader &&
@@ -2840,16 +2918,19 @@ export class MatchEngine {
     const skillFactor = isHeader ? headingAttr : finishAttr * 0.55 + accuracyAttr * 0.45;
     const isRivalAI =
       shooter.side !== this.userSide && !(this.twoPlayerMode && shooter.side === 'away');
-    const isExtremeRivalAI = isRivalAI && this.difficulty >= 7;
-    const aiAccuracyScale = isExtremeRivalAI
+    const isTitanShooter = Boolean(isRacingTitansMasterFlagEnabled() && shooter.isRacingTitan);
+    const isExtremeRivalAI = (isRivalAI && this.difficulty >= 7) || (isTitanShooter && isRivalAI);
+    const aiAccuracyScale = isTitanShooter
+      ? 0
+      : isExtremeRivalAI
       ? 0.008
       : isRivalAI
       ? Math.min(1.0, getDifficultyProfile(this.difficulty).shotErrorMeters / 3.2)
       : isPlacedFinesseShot
-      ? 0.72
-      : 1.0;
+      ? 0.74
+      : 1.05;
 
-    // En dificultad máxima, el rival apunta milimétricamente al poste más lejano del arquero del usuario (99% efectividad)
+    // En dificultad máxima o IA de Racing Titanes, el rematador apunta milimétricamente al poste más lejano del arquero
     let effectiveTargetY = targetY;
     if (isExtremeRivalAI) {
       const oppGk = this.players.find((p) => p.side !== shooter.side && p.player.position === 'GK');
@@ -2861,10 +2942,16 @@ export class MatchEngine {
           : PITCH.HALF_Y + lethalCornerMargin;
     }
 
-    // Sobrecarga (> 93% de barra) aumenta riesgo de mandarla arriba o desviada
-    const overchargePenalty = !isRivalAI && power > 0.93 ? (power - 0.93) * 8.5 : 0;
+    // Sobrecarga (> 90% de barra) aumenta riesgo de mandarla arriba o desviada
+    const overchargePenalty = !isRivalAI && power > 0.90 ? (power - 0.90) * 9.5 : 0;
     const spread =
-      ((1 - skillFactor) * 2.55 + fatiguePenalty + pressurePenalty + bodyAnglePenalty + overchargePenalty) *
+      ((1 - skillFactor) * 2.75 +
+        fatiguePenalty +
+        pressurePenalty +
+        distancePenalty +
+        narrowAnglePenalty +
+        bodyAnglePenalty +
+        overchargePenalty) *
       aiAccuracyScale;
     const finalY = effectiveTargetY + (this.rng() - 0.5) * spread;
 
@@ -2972,21 +3059,59 @@ export class MatchEngine {
     if (isPass) this.onSound?.('kick_light');
   }
 
+  private triggerTitanFootstepTremor(p: MatchPlayerState, isFocusPlayer: boolean): void {
+    if (this.titanFootstepCooldown > 0) return;
+    this.titanFootstepCooldown = 0.27;
+    this.onSound?.('titan_footstep');
+    const shakeIntensity = isFocusPlayer
+      ? RACING_TITANS_CONFIG.FOOTSTEP_CAMERA_SHAKE_CARRIER
+      : RACING_TITANS_CONFIG.FOOTSTEP_CAMERA_SHAKE_OFFBALL;
+    this.cameraShake = Math.max(this.cameraShake, shakeIntensity);
+    this.emitParticles(p.x, p.y, 0.03, 2, 'dust');
+  }
+
   private attemptTackle(
     tackler: MatchPlayerState,
     carrier: MatchPlayerState,
     isSlide: boolean
   ): void {
+    const masterTitanFlag = isRacingTitansMasterFlagEnabled();
+    const carrierIsTitan = Boolean(masterTitanFlag && carrier.isRacingTitan);
+    const tacklerIsTitan = Boolean(masterTitanFlag && tackler.isRacingTitan);
+
+    // Imparables: los Titanes de Racing no pierden el balón en choques o barridas contra jugadores normales,
+    // no son derribados ni lesionados, y empujan al rival al contacto.
+    if (carrierIsTitan && !tacklerIsTitan) {
+      const dx = tackler.x - carrier.x;
+      const dy = tackler.y - carrier.y;
+      const dist = Math.max(0.01, Math.hypot(dx, dy));
+      const nx = dx / dist;
+      const ny = dy / dist;
+      tackler.vx = nx * 6.2;
+      tackler.vy = ny * 6.2;
+      tackler.x += nx * 0.45;
+      tackler.y += ny * 0.45;
+      tackler.stunTimer = 0.55;
+      tackler.jostleTimer = 0.45;
+      tackler.tackleCooldown = 0.75;
+      carrier.fallTimer = 0;
+      carrier.stunTimer = 0;
+      carrier.injured = false;
+      this.onSound?.('body_clash');
+      this.emitParticles(tackler.x, tackler.y, 0.05, 6, 'dust');
+      return;
+    }
+
     const outcome = evaluateTackleOutcome(tackler, carrier, isSlide, this.rng, this.ball);
     const tStats = tackler.side === 'home' ? this.homeStats : this.awayStats;
 
-    if (outcome.knockdown) {
+    if (outcome.knockdown && !carrierIsTitan) {
       carrier.fallTimer = 0.85;
       carrier.animState = 'fall';
       this.emitParticles(carrier.x, carrier.y, 0.05, 8, 'dust');
     }
 
-    if (outcome.injuryTriggered && !carrier.injured) {
+    if (outcome.injuryTriggered && !carrier.injured && !carrierIsTitan) {
       carrier.injured = true;
       this.onCommentary?.({
         type: 'injury',
@@ -3285,25 +3410,124 @@ export class MatchEngine {
     const owner = this.players.find((p) => p.id === this.ball.ownerId) ?? null;
 
     if (owner) {
-      // Conducción realista: el jugador lleva el balón pegado al pie con toques cada pocos pasos,
-      // y el balón se separa más hacia adelante al sprintar (> 6.8 m/s).
+      // Conducción realista: la pelota NO va pegada de forma rígida al jugador.
+      // Al sprintar (> 6.4 m/s) o hacer un giro brusco a alta velocidad (dribbleLooseTimer > 0),
+      // la pelota se adelanta más respecto al pie y puede ser anticipada o punteada por defensores cercanos.
       const speed = Math.hypot(owner.vx, owner.vy);
-      const isSprinting = speed > 6.8;
+      const isSprinting = speed > 6.4;
+      const isLooseTurn = (owner.dribbleLooseTimer ?? 0) > 0;
       const strideTouchWave = speed > 0.5 ? Math.max(0, Math.sin(owner.stridePhase * 0.85)) : 0;
 
-      const baseFootDist = isSprinting ? 0.78 : 0.48;
-      const touchKickOut = isSprinting ? strideTouchWave * 0.46 : strideTouchWave * 0.18;
-      const lead = baseFootDist + touchKickOut;
+      const ownerIsTitan = Boolean(isRacingTitansMasterFlagEnabled() && owner.isRacingTitan);
+      const footContactScale = ownerIsTitan ? RACING_TITANS_CONFIG.TITAN_FOOT_CONTACT_SCALE : 1.0;
 
-      // Oscilación lateral sutil entre pie izquierdo y derecho durante la conducción
-      const footLateral = speed > 0.8 ? Math.cos(owner.stridePhase * 0.85) * 0.12 : 0;
+      const dribbleControlNorm = owner.player.attributes.dribbling / 100;
+      const baseFootDist = (isSprinting ? 0.90 - dribbleControlNorm * 0.10 : 0.58) * footContactScale;
+      const touchKickOut = (isSprinting ? strideTouchWave * 0.52 : strideTouchWave * 0.20) * (ownerIsTitan ? 1.35 : 1.0);
+      const looseTurnPush = !ownerIsTitan && isLooseTurn ? 0.36 * (1.15 - dribbleControlNorm * 0.35) : 0;
+      const lead = baseFootDist + touchKickOut + looseTurnPush;
+
+      // Oscilación lateral sutil entre pie izquierdo y derecho durante la conducción (escalada a los pies del Titán)
+      const footLateral = speed > 0.8 ? Math.cos(owner.stridePhase * 0.85) * 0.13 * (ownerIsTitan ? 1.85 : 1.0) : 0;
       const cosF = Math.cos(owner.facing);
       const sinF = Math.sin(owner.facing);
 
-      this.ball.x = owner.x + cosF * lead - sinF * footLateral;
-      this.ball.y = owner.y + sinF * lead + cosF * footLateral;
+      let nextBallX = owner.x + cosF * lead - sinF * footLateral;
+      const nextBallY = owner.y + sinF * lead + cosF * footLateral;
+
+      // PROHIBIDO METER GOLES CAMINANDO CON LA PELOTA PEGADA:
+      // Un jugador conduciendo no puede simplemente caminar dentro del arco sin patear/rematar.
+      if (Math.abs(nextBallY - PITCH.HALF_Y) < PITCH.GOAL_HALF + 0.85) {
+        if (owner.side === 'home' && nextBallX > PITCH.LENGTH - 0.28) {
+          nextBallX = PITCH.LENGTH - 0.28;
+          owner.x = Math.min(owner.x, PITCH.LENGTH - 0.85 * footContactScale);
+        } else if (owner.side === 'away' && nextBallX < 0.28) {
+          nextBallX = 0.28;
+          owner.x = Math.max(owner.x, 0.85 * footContactScale);
+        }
+      }
+
+      this.ball.x = nextBallX;
+      this.ball.y = nextBallY;
       this.ball.vx = owner.vx;
       this.ball.vy = owner.vy;
+
+      // 1) Si el arquero rival sale a achicar en mano a mano (1v1) y el portador intenta meterse al área chica sin definir,
+      // el arquero se arroja a los pies y le traba/atrapa la pelota limpiamente (salvo que el portador sea un Titán imparable contra arquero normal).
+      const oppGk = this.players.find(
+        (p) => p.side !== owner.side && p.player.position === 'GK' && !p.redCard && p.stunTimer <= 0
+      );
+      const oppGkIsTitan = Boolean(isRacingTitansMasterFlagEnabled() && oppGk?.isRacingTitan);
+      if (oppGk && owner.player.position !== 'GK' && (!ownerIsTitan || oppGkIsTitan)) {
+        const distGkToBall = Math.hypot(oppGk.x - this.ball.x, oppGk.y - this.ball.y);
+        const gkSmotherReach = oppGkIsTitan
+          ? RACING_TITANS_CONFIG.TITAN_GK_REACH_Y_M
+          : oppGk.diveTimer > 0
+          ? 2.35
+          : 2.10;
+        if (distGkToBall < gkSmotherReach) {
+          const gStats = oppGk.side === 'home' ? this.homeStats : this.awayStats;
+          gStats.saves++;
+          oppGk.diveTimer = 0.65;
+          oppGk.gkAction = 'rush_out';
+          oppGk.animState = 'gk_action';
+          oppGk.aiHoldTimer = 0.85;
+          if (!ownerIsTitan) owner.stunTimer = 0.48;
+          this.ball.ownerId = oppGk.id;
+          this.ball.x = oppGk.x;
+          this.ball.y = oppGk.y;
+          this.ball.vx = 0;
+          this.ball.vy = 0;
+          this.ball.lastTouchTeam = oppGk.side;
+          this.ball.lastTouchPlayerId = oppGk.id;
+          this.ball.lastTouchPlayerName = oppGk.player.name;
+          this.onSound?.('save_clap');
+          this.showBanner(`¡Achique letal de ${oppGk.player.name} en el mano a mano!`);
+          this.enterGoalKickAim(oppGk, true);
+          return;
+        }
+      }
+
+      // 2) Si el portador (no Titán) adelanta demasiado la pelota al sprintar o hacer un giro brusco (isLooseTurn / isSprinting),
+      // un defensor bien perfilado a menos de 1.55m del balón adelantado puede interceptarla limpiamente.
+      if (!ownerIsTitan && (isLooseTurn || (isSprinting && strideTouchWave > 0.55)) && owner.player.position !== 'GK') {
+        for (const def of this.players) {
+          if (
+            def.side === owner.side ||
+            def.redCard ||
+            def.stunTimer > 0 ||
+            def.tackleCooldown > 0
+          ) {
+            continue;
+          }
+          const defIsTitan = Boolean(isRacingTitansMasterFlagEnabled() && def.isRacingTitan);
+          const distDefToLooseBall = Math.hypot(def.x - this.ball.x, def.y - this.ball.y);
+          const distDefToOwner = Math.hypot(def.x - owner.x, def.y - owner.y);
+          const interceptRadius = defIsTitan ? 2.65 : 1.38;
+          if (distDefToLooseBall < interceptRadius && (defIsTitan || distDefToLooseBall < distDefToOwner - 0.15)) {
+            const interceptChance = defIsTitan ? 1.0 : isLooseTurn ? 0.58 : 0.34;
+            if (this.rng() < interceptChance) {
+              const dStats = def.side === 'home' ? this.homeStats : this.awayStats;
+              dStats.tackles++;
+              owner.stunTimer = 0.36;
+              owner.dribbleLooseTimer = 0;
+              def.tackleCooldown = 0.48;
+              def.standingTackleTimer = 0.26;
+              this.ball.ownerId = def.id;
+              this.ball.lastTouchTeam = def.side;
+              this.ball.lastTouchPlayerId = def.id;
+              this.ball.lastTouchPlayerName = def.player.name;
+              this.onSound?.('kick_light');
+              if (def.side === this.userSide) {
+                this.activeUserPlayerId = def.id;
+              } else if (this.twoPlayerMode && def.side === 'away') {
+                this.activeUser2PlayerId = def.id;
+              }
+              return;
+            }
+          }
+        }
+      }
 
       // Giro visual del balón rodando sobre el césped
       if (speed > 2.5 && strideTouchWave > 0.88 && this.matchMinute - this.lastDribbleTapTime > 0.015) {
@@ -3364,22 +3588,37 @@ export class MatchEngine {
         });
       }
 
-      const profile = getDifficultyProfile(this.difficulty);
+      const baseProfile = getDifficultyProfile(this.difficulty);
+      const masterTitanFlag = isRacingTitansMasterFlagEnabled();
 
       for (const p of this.players) {
         if (p.redCard || p.stunTimer > 0 || p.kickAnimTimer > 0.14) continue;
         const isGk = p.player.position === 'GK';
+        const isTitan = Boolean(masterTitanFlag && p.isRacingTitan);
+        const profile = isTitan ? RACING_TITANS_AI_PROFILE : baseProfile;
         const isRivalAI =
           p.side !== this.userSide && !(this.twoPlayerMode && p.side === 'away');
-        // Radio de captura magnético: si un jugador está cerca de la pelota o pasa cerca, la controla (mayor anticipación de IA en dificultad máxima)
+        // Hitbox y alcance coherentes con el tamaño:
+        // - Arquero Titán cubre casi todo el arco de 9.8m x 3.1m (4.55m hacia cada lado y 3.75m de altura)
+        // - Jugador de campo Titán tiene radio de contacto de pies escalado para no trabarse con el balón
         const reach = isGk
-          ? p.diveTimer > 0
-            ? 2.45
-            : 1.95
+          ? isTitan
+            ? RACING_TITANS_CONFIG.TITAN_GK_REACH_Y_M
+            : p.diveTimer > 0
+            ? 2.58
+            : 2.10
+          : isTitan
+          ? 1.46 * RACING_TITANS_CONFIG.TITAN_FOOT_CONTACT_SCALE
           : isRivalAI && profile.level >= 7
           ? 1.76
           : 1.46;
-        const maxHeight = isGk ? PITCH.GOAL_HEIGHT + 0.18 : 1.82;
+        const maxHeight = isGk
+          ? isTitan
+            ? RACING_TITANS_CONFIG.TITAN_GK_REACH_Z_M
+            : PITCH.GOAL_HEIGHT + 0.22
+          : isTitan
+          ? 1.82 * (p.titanScale ?? RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE)
+          : 1.82;
         const d = Math.hypot(this.ball.x - p.x, this.ball.y - p.y);
         if (d < reach && this.ball.z <= maxHeight) {
           if (
@@ -3472,9 +3711,20 @@ export class MatchEngine {
               break;
             } else {
               this.showBanner(`¡Atajada limpia de ${p.player.name}!`);
-              // El arquero ataja ÉL SOLO: retenemos 0.85s mientras compañeros y rivales suben hacia mitad de cancha
-              p.aiHoldTimer = 0.85;
+              this.enterGoalKickAim(p, true);
+              break;
             }
+          }
+
+          // Si el arquero recoge un balón suelto en su área proveniente del rival, entra en GOAL_KICK_AIM con el balón en las manos
+          if (
+            isGk &&
+            this.ball.lastTouchTeam !== p.side &&
+            ((p.side === 'home' && p.x <= 16.5) || (p.side === 'away' && p.x >= PITCH.LENGTH - 16.5)) &&
+            Math.abs(p.y - PITCH.HALF_Y) <= 20.16
+          ) {
+            this.enterGoalKickAim(p, true);
+            break;
           }
 
           // Remate DE PRIMERA INTENCIÓN (First-Time Shot) para la IA cuando recibe un pase o centro en zona de gol (<22.5m)
@@ -3510,10 +3760,11 @@ export class MatchEngine {
               isRivalAI && profile.level >= 7
                 ? 0.04 + this.rng() * 0.05
                 : 0.24 + this.rng() * 0.24;
+          } else {
+            this.enterGoalKickAim(p, true);
+            break;
           }
 
-          // Cuando el arquero controla la pelota, NO cambiamos activeUserPlayerId a un jugador pegado ni teletransportamos a nadie;
-          // el arquero la tiene él solo.
           if (p.side === this.userSide) {
             this.activeUserPlayerId = p.id;
           } else if (this.twoPlayerMode && p.side === 'away') {
@@ -3729,7 +3980,7 @@ export class MatchEngine {
     this.restartTeam = scoringSide === 'home' ? 'away' : 'home';
   }
 
-  private triggerSetPiece(
+  public triggerSetPiece(
     type: RestartType,
     team: 'home' | 'away',
     x: number,
@@ -3873,6 +4124,10 @@ export class MatchEngine {
       this.showBanner(
         `Saque de meta · ${taker?.player.name ?? 'Arquero'} (${shortTeam})`
       );
+      if (taker) {
+        this.enterGoalKickAim(taker, false);
+      }
+      return;
     } else if (type === 'corner') {
       // Posicionar atacantes y defensores dentro del área penal listos para cabecear,
       // más una opción de córner en corto y dos jugadores en la medialuna para el rebote
@@ -4067,8 +4322,491 @@ export class MatchEngine {
     }
   }
 
+  /**
+   * Entra en el estado GOAL_KICK_AIM cuando el arquero tiene el balón en un saque de meta o en las manos.
+   * - Congela a todos los jugadores rivales y compañeros de campo (posición, IA y animaciones de carrera).
+   * - Si es del usuario, NO hay temporizador que patee solo.
+   * - Si es del arquero rival (IA), mantiene a todos los jugadores congelados hasta que el arquero IA ejecute su saque automático.
+   */
+  public enterGoalKickAim(keeper: MatchPlayerState, isFromHands: boolean): void {
+    const team = keeper.side;
+    const isUserControlled =
+      team === this.userSide || (this.twoPlayerMode && team === 'away');
+
+    this.phase = 'GOAL_KICK_AIM';
+    this.restartType = 'goal_kick';
+    this.restartTeam = team;
+    this.pendingPassCheck = null;
+    this.advantageState = null;
+    this.freeKickState = null;
+    this.cutsceneState = null;
+
+    if (!isFromHands) {
+      this.restartX = team === 'home' ? 5.5 : PITCH.LENGTH - 5.5;
+      this.restartY = PITCH.HALF_Y;
+      this.ball.x = this.restartX;
+      this.ball.y = this.restartY;
+      this.ball.z = 0;
+      keeper.x = this.restartX + (team === 'home' ? -0.65 : 0.65);
+      keeper.y = this.restartY;
+    } else {
+      keeper.x =
+        team === 'home'
+          ? Math.max(2.5, Math.min(15.2, keeper.x))
+          : Math.max(PITCH.LENGTH - 15.2, Math.min(PITCH.LENGTH - 2.5, keeper.x));
+      keeper.y = Math.max(15.5, Math.min(PITCH.WIDTH - 15.5, keeper.y));
+      this.restartX = keeper.x + (team === 'home' ? 0.48 : -0.48);
+      this.restartY = keeper.y;
+      this.ball.x = this.restartX;
+      this.ball.y = this.restartY;
+      this.ball.z = 0.85;
+
+      // Garantizar que ningún rival quede dentro del área disputando el balón y que los defensas estén abiertos para pase corto
+      for (const p of this.players) {
+        if (p.redCard || p.id === keeper.id) continue;
+        if (p.side !== team) {
+          if (team === 'home' && p.x < 19.5) p.x = 19.5 + (p.slotIndex % 3) * 1.8;
+          if (team === 'away' && p.x > PITCH.LENGTH - 19.5) {
+            p.x = PITCH.LENGTH - 19.5 - (p.slotIndex % 3) * 1.8;
+          }
+        } else if (p.slotIndex === 2 || p.slotIndex === 3) {
+          p.x = team === 'home' ? 16.5 : PITCH.LENGTH - 16.5;
+          p.y = p.slotIndex === 2 ? PITCH.HALF_Y - 13.5 : PITCH.HALF_Y + 13.5;
+        }
+      }
+    }
+
+    const baseAngle = team === 'home' ? 0 : Math.PI;
+    keeper.facing = baseAngle;
+    keeper.lookTargetAngle = baseAngle;
+    keeper.aiHoldTimer = 0;
+
+    // Congelar a todos los jugadores (rivales y compañeros de campo)
+    for (const p of this.players) {
+      p.inWall = false;
+      p.vx = 0;
+      p.vy = 0;
+      p.animState = 'idle';
+      p.kickAnimTimer = 0;
+      p.slideTimer = 0;
+      if (p.id !== keeper.id) {
+        p.diveTimer = 0;
+      }
+    }
+
+    this.ball.ownerId = keeper.id;
+    this.ball.vx = 0;
+    this.ball.vy = 0;
+    this.ball.vz = 0;
+    this.ball.lastTouchTeam = team;
+    this.ball.lastTouchPlayerId = keeper.id;
+    this.ball.lastTouchPlayerName = keeper.player.name;
+
+    if (team === this.userSide) {
+      this.activeUserPlayerId = keeper.id;
+    } else if (this.twoPlayerMode && team === 'away') {
+      this.activeUser2PlayerId = keeper.id;
+    }
+
+    // Limpiar entradas previas para que el arquero no patee por un input residual del frame anterior
+    const input = this.twoPlayerMode && team === 'away' ? this.userInput2 : this.userInput;
+    input.passPressed = false;
+    input.throughPressed = false;
+    input.crossPressed = false;
+    input.shootHeld = false;
+    input.shootReleased = false;
+    input.skillMovePressed = false;
+
+    this.goalKickAimState = {
+      active: true,
+      team,
+      keeperId: keeper.id,
+      keeperName: keeper.player.name,
+      isUserControlled,
+      isFromHands,
+      aimAngleRad: 0,
+      elevationSlider: 0.65,
+      chargePower: 0,
+      isChargingShoot: false,
+      aiDelayTimer: isUserControlled ? 0 : 0.68,
+    };
+
+    const nearestDef = this.findNearestDefenderInAimDirection(keeper, baseAngle);
+    if (team === this.userSide) {
+      this.targetedPassMateId = nearestDef?.id ?? null;
+    } else if (this.twoPlayerMode && team === 'away') {
+      this.targetedPassMateId2 = nearestDef?.id ?? null;
+    }
+  }
+
+  public setGoalKickElevationSlider(val: number): void {
+    if (!this.goalKickAimState) return;
+    this.goalKickAimState.elevationSlider = Math.max(0, Math.min(1, val));
+  }
+
+  public adjustGoalKickAimAngle(deltaRad: number): void {
+    if (!this.goalKickAimState) return;
+    this.goalKickAimState.aimAngleRad = Math.max(
+      -1.08,
+      Math.min(1.08, this.goalKickAimState.aimAngleRad + deltaRad)
+    );
+  }
+
+  /**
+   * Encuentra al defensor compañero más cercano a la dirección apuntada por el arquero para el saque corto rasante (Botón PASAR).
+   */
+  public findNearestDefenderInAimDirection(
+    keeper: MatchPlayerState,
+    worldAimAngle: number
+  ): MatchPlayerState | null {
+    const teammates = this.players.filter(
+      (p) =>
+        p.side === keeper.side &&
+        p.id !== keeper.id &&
+        !p.redCard &&
+        p.player.position !== 'GK'
+    );
+    if (teammates.length === 0) return null;
+
+    // Priorizar defensores (CB, LB, RB o slots 1..4) o compañeros cercanos (< 36m)
+    const defenders = teammates.filter(
+      (p) =>
+        p.player.position === 'CB' ||
+        p.player.position === 'LB' ||
+        p.player.position === 'RB' ||
+        p.slotIndex <= 4 ||
+        Math.hypot(p.x - this.ball.x, p.y - this.ball.y) < 34
+    );
+    const pool = defenders.length > 0 ? defenders : teammates;
+
+    let bestMate: MatchPlayerState = pool[0];
+    let bestCost = Infinity;
+
+    for (const m of pool) {
+      const dx = m.x - this.ball.x;
+      const dy = m.y - this.ball.y;
+      const dist = Math.hypot(dx, dy);
+      const angToMate = Math.atan2(dy, dx);
+      let angleDiff = Math.abs(angToMate - worldAimAngle);
+      while (angleDiff > Math.PI) {
+        angleDiff = Math.abs(angleDiff - Math.PI * 2);
+      }
+      const isDefBonus =
+        m.player.position === 'CB' ||
+        m.player.position === 'LB' ||
+        m.player.position === 'RB' ||
+        m.slotIndex <= 4
+          ? -3.5
+          : 0;
+      const cost = angleDiff * 30.0 + dist * 0.42 + isDefBonus;
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestMate = m;
+      }
+    }
+
+    return bestMate;
+  }
+
+  private stepGoalKickAim(dt: number): void {
+    const aim = this.goalKickAimState;
+    if (!aim) {
+      this.phase = 'live';
+      return;
+    }
+
+    const keeper =
+      this.players.find((p) => p.id === aim.keeperId) ??
+      this.players.find((p) => p.side === aim.team && !p.redCard && p.player.position === 'GK') ??
+      this.players.find((p) => p.side === aim.team && !p.redCard);
+
+    if (!keeper) {
+      this.goalKickAimState = null;
+      this.phase = 'live';
+      return;
+    }
+
+    // 1. Mantener congelados a todos los jugadores rivales y compañeros de campo (posición, IA y animaciones de carrera)
+    for (const p of this.players) {
+      p.vx = 0;
+      p.vy = 0;
+      p.inWall = false;
+      if (p.id !== keeper.id) {
+        p.animState = 'idle';
+        p.kickAnimTimer = 0;
+        p.slideTimer = 0;
+        p.diveTimer = 0;
+      }
+    }
+
+    const baseAngle = aim.team === 'home' ? 0 : Math.PI;
+
+    if (!aim.isUserControlled) {
+      // Arquero rival (IA): mantiene a todos los jugadores congelados hasta que patea automáticamente
+      const worldAimAngle = baseAngle + aim.aimAngleRad;
+      keeper.facing = worldAimAngle;
+      keeper.lookTargetAngle = worldAimAngle;
+      keeper.animState = 'idle';
+      this.ball.ownerId = keeper.id;
+      this.ball.vx = 0;
+      this.ball.vy = 0;
+      this.ball.vz = 0;
+
+      aim.aiDelayTimer -= dt;
+      if (aim.aiDelayTimer <= 0) {
+        this.executeAiGoalKickFromAim(keeper);
+      }
+      return;
+    }
+
+    // 2. Arquero del usuario: NO patea solo y NO hay temporizador que lo haga patear automáticamente
+    const input = this.twoPlayerMode && aim.team === 'away' ? this.userInput2 : this.userInput;
+
+    // El joystick izquierdo mueve la dirección horizontal del saque
+    if (Math.abs(input.moveX) > 0.08 || Math.abs(input.moveY) > 0.08) {
+      const steer =
+        Math.abs(input.moveX) >= Math.abs(input.moveY) * 0.6
+          ? input.moveX
+          : input.moveY * (aim.team === 'home' ? 1 : -1);
+      aim.aimAngleRad = Math.max(-1.08, Math.min(1.08, aim.aimAngleRad + steer * dt * 1.75));
+    }
+
+    const worldAimAngle = baseAngle + aim.aimAngleRad;
+    keeper.facing = worldAimAngle;
+    keeper.lookTargetAngle = worldAimAngle;
+    keeper.animState = 'idle';
+
+    if (aim.isFromHands) {
+      this.ball.x = keeper.x + Math.cos(worldAimAngle) * 0.48;
+      this.ball.y = keeper.y + Math.sin(worldAimAngle) * 0.48;
+      this.ball.z = 0.85;
+    } else {
+      this.ball.x = this.restartX;
+      this.ball.y = this.restartY;
+      this.ball.z = 0;
+      keeper.x = this.ball.x - Math.cos(worldAimAngle) * 0.65;
+      keeper.y = this.ball.y - Math.sin(worldAimAngle) * 0.65;
+    }
+    this.ball.ownerId = keeper.id;
+    this.ball.vx = 0;
+    this.ball.vy = 0;
+    this.ball.vz = 0;
+
+    // Actualizar el defensa objetivo más cercano a la dirección apuntada
+    const nearestDef = this.findNearestDefenderInAimDirection(keeper, worldAimAngle);
+    if (aim.team === this.userSide) {
+      this.activeUserPlayerId = keeper.id;
+      this.targetedPassMateId = nearestDef?.id ?? null;
+    } else if (this.twoPlayerMode && aim.team === 'away') {
+      this.activeUser2PlayerId = keeper.id;
+      this.targetedPassMateId2 = nearestDef?.id ?? null;
+    }
+
+    // Botón TIRO: mantenerlo presionado carga la potencia y al soltarlo el arquero patea
+    if (input.shootHeld) {
+      aim.isChargingShoot = true;
+      aim.chargePower = Math.min(1.0, aim.chargePower + dt / 0.52);
+    }
+
+    if (input.shootReleased) {
+      input.shootReleased = false;
+      input.shootHeld = false;
+      const finalPower = Math.max(
+        0.25,
+        Math.min(1.0, aim.chargePower > 0.08 ? aim.chargePower : input.shootPower || 0.72)
+      );
+      this.executeGoalKickAimShot(finalPower);
+      return;
+    }
+
+    // Botón PASAR: saque corto rasante hacia el defensa más cercano a la dirección apuntada
+    if (input.passPressed) {
+      input.passPressed = false;
+      input.shootHeld = false;
+      this.executeGoalKickAimShortPass();
+      return;
+    }
+
+    input.throughPressed = false;
+    input.crossPressed = false;
+    input.tacklePressed = false;
+    input.slidePressed = false;
+    input.skillMovePressed = false;
+  }
+
+  /**
+   * Ejecuta el saque del arquero al soltar el botón TIRO con la dirección, altura (slider vertical) y potencia cargada,
+   * descongelando en ese mismo instante a todos los jugadores y devolviendo la cámara al partido.
+   */
+  public executeGoalKickAimShot(chargePowerOverride?: number): void {
+    const aim = this.goalKickAimState;
+    const team = aim?.team ?? this.restartTeam;
+    const keeper =
+      (aim && this.players.find((p) => p.id === aim.keeperId)) ??
+      this.players.find((p) => p.side === team && !p.redCard && p.player.position === 'GK') ??
+      this.players.find((p) => p.id === this.ball.ownerId);
+
+    if (!keeper) {
+      this.goalKickAimState = null;
+      this.phase = 'live';
+      return;
+    }
+
+    const baseAngle = keeper.side === 'home' ? 0 : Math.PI;
+    const worldAimAngle = baseAngle + (aim?.aimAngleRad ?? 0);
+    const elev = Math.max(0, Math.min(1, aim?.elevationSlider ?? 0.65));
+    const charge = Math.max(
+      0.25,
+      Math.min(1, chargePowerOverride ?? (aim && aim.chargePower > 0.08 ? aim.chargePower : 0.75))
+    );
+
+    const combinedPower = Math.max(0.18, Math.min(1.0, elev * 0.55 + charge * 0.45));
+    const kickDistance = 16 + combinedPower * 54;
+    const horizontalSpeed = 14.5 + combinedPower * 16.5;
+    const verticalVz =
+      elev < 0.22
+        ? 0.24 + elev * 1.4
+        : 1.25 + elev * 7.6 * (0.65 + charge * 0.35);
+    const strikeType: StrikeType =
+      elev < 0.25 ? 'raso' : elev > 0.58 ? 'globo' : 'colocado';
+
+    const tx = Math.max(2, Math.min(PITCH.LENGTH - 2, this.ball.x + Math.cos(worldAimAngle) * kickDistance));
+    const ty = Math.max(2, Math.min(PITCH.WIDTH - 2, this.ball.y + Math.sin(worldAimAngle) * kickDistance));
+
+    keeper.facing = worldAimAngle;
+    keeper.lookTargetAngle = worldAimAngle;
+    keeper.gkAction = 'distribute';
+    keeper.animState = 'shoot';
+    keeper.kickAnimTimer = 0.38;
+
+    this.ball.z = 0.12;
+    this.goalKickAimState = null;
+    this.phase = 'live';
+
+    this.kickBallToward(keeper, tx, ty, horizontalSpeed, verticalVz, true, strikeType);
+
+    const bestReceiver = this.players
+      .filter(
+        (p) =>
+          p.side === keeper.side &&
+          p.id !== keeper.id &&
+          !p.redCard &&
+          p.player.position !== 'GK'
+      )
+      .sort(
+        (a, b) =>
+          Math.hypot(a.x - tx, a.y - ty) - Math.hypot(b.x - tx, b.y - ty)
+      )[0];
+
+    if (keeper.side === this.userSide && bestReceiver) {
+      this.activeUserPlayerId = bestReceiver.id;
+    } else if (this.twoPlayerMode && keeper.side === 'away' && bestReceiver) {
+      this.activeUser2PlayerId = bestReceiver.id;
+    }
+
+    const gkTeam = keeper.side === 'home' ? this.homeTeam.name : this.awayTeam.name;
+    this.onCommentary?.({
+      type: 'pass',
+      playerName: keeper.player.name,
+      teamName: gkTeam,
+    });
+  }
+
+  /**
+   * Ejecuta un saque corto rasante (Botón PASAR) hacia el defensa compañero más cercano a la dirección apuntada,
+   * descongelando de inmediato a todos los jugadores y devolviendo la cámara al juego.
+   */
+  public executeGoalKickAimShortPass(): void {
+    const aim = this.goalKickAimState;
+    const team = aim?.team ?? this.restartTeam;
+    const keeper =
+      (aim && this.players.find((p) => p.id === aim.keeperId)) ??
+      this.players.find((p) => p.side === team && !p.redCard && p.player.position === 'GK') ??
+      this.players.find((p) => p.id === this.ball.ownerId);
+
+    if (!keeper) {
+      this.goalKickAimState = null;
+      this.phase = 'live';
+      return;
+    }
+
+    const baseAngle = keeper.side === 'home' ? 0 : Math.PI;
+    const worldAimAngle = baseAngle + (aim?.aimAngleRad ?? 0);
+    const targetDefender = this.findNearestDefenderInAimDirection(keeper, worldAimAngle);
+
+    const tx = targetDefender
+      ? targetDefender.x
+      : Math.max(4, Math.min(PITCH.LENGTH - 4, this.ball.x + Math.cos(worldAimAngle) * 16));
+    const ty = targetDefender
+      ? targetDefender.y
+      : Math.max(4, Math.min(PITCH.WIDTH - 4, this.ball.y + Math.sin(worldAimAngle) * 16));
+
+    const dist = Math.hypot(tx - this.ball.x, ty - this.ball.y);
+    const passSpeed = Math.max(13.5, Math.min(20.5, 9.5 + dist * 0.42));
+
+    keeper.facing = Math.atan2(ty - keeper.y, tx - keeper.x);
+    keeper.lookTargetAngle = keeper.facing;
+    keeper.gkAction = 'distribute';
+    keeper.animState = 'pass';
+    keeper.kickAnimTimer = 0.32;
+
+    this.ball.z = 0.08;
+    this.goalKickAimState = null;
+    this.phase = 'live';
+
+    this.kickBallToward(keeper, tx, ty, passSpeed, 0.22, true, 'raso');
+
+    if (keeper.side === this.userSide && targetDefender) {
+      this.activeUserPlayerId = targetDefender.id;
+    } else if (this.twoPlayerMode && keeper.side === 'away' && targetDefender) {
+      this.activeUser2PlayerId = targetDefender.id;
+    }
+
+    const gkTeam = keeper.side === 'home' ? this.homeTeam.name : this.awayTeam.name;
+    this.onCommentary?.({
+      type: 'pass',
+      playerName: keeper.player.name,
+      teamName: gkTeam,
+    });
+  }
+
+  private executeAiGoalKickFromAim(keeper: MatchPlayerState): void {
+    const candidates = this.players.filter(
+      (p) =>
+        p.side === keeper.side &&
+        p.id !== keeper.id &&
+        !p.redCard &&
+        p.player.position !== 'GK'
+    );
+
+    const targetMate =
+      candidates.find((p) => p.slotIndex >= 5 && p.slotIndex <= 8) ??
+      candidates[Math.floor(this.rng() * Math.max(1, candidates.length))];
+
+    const tx = targetMate ? targetMate.x : PITCH.HALF_X;
+    const ty = targetMate ? targetMate.y : PITCH.HALF_Y + (this.rng() - 0.5) * 18;
+
+    keeper.facing = Math.atan2(ty - keeper.y, tx - keeper.x);
+    keeper.lookTargetAngle = keeper.facing;
+    keeper.gkAction = 'distribute';
+    keeper.animState = 'shoot';
+    keeper.kickAnimTimer = 0.36;
+
+    this.ball.z = 0.12;
+    this.goalKickAimState = null;
+    this.phase = 'live';
+
+    this.kickBallToward(keeper, tx, ty, 23.5, 5.4, true, 'globo');
+
+    const gkTeam = keeper.side === 'home' ? this.homeTeam.name : this.awayTeam.name;
+    this.onCommentary?.({
+      type: 'pass',
+      playerName: keeper.player.name,
+      teamName: gkTeam,
+    });
+  }
+
   private executeAiSetPiece(preferShortOption = false): void {
-    // En saque de arco (goal_kick), garantizar que SIEMPRE patee el ARQUERO (position === 'GK')
     const taker =
       this.restartType === 'goal_kick'
         ? this.players.find(
@@ -4078,58 +4816,11 @@ export class MatchEngine {
     if (!taker) return;
 
     if (this.restartType === 'goal_kick') {
-      this.ball.ownerId = taker.id;
-      this.ball.x = taker.side === 'home' ? 5.5 : PITCH.LENGTH - 5.5;
-      this.ball.y = PITCH.HALF_Y;
-      taker.x = this.ball.x + (taker.side === 'home' ? -0.55 : 0.55);
-      taker.y = PITCH.HALF_Y;
-      taker.facing = taker.side === 'home' ? 0 : Math.PI;
-      taker.gkAction = 'distribute';
-      taker.animState = 'pass';
-
-      const candidates = this.players.filter(
-        (p) =>
-          p.side === taker.side &&
-          p.id !== taker.id &&
-          !p.redCard &&
-          p.player.position !== 'GK'
-      );
-
-      // Si el usuario pulsa PASE (preferShortOption = true), el arquero toca en corto a un defensor central abierto;
-      // de lo contrario, ejecuta el pelotazo largo al mediocampo.
-      const shortDefender = preferShortOption
-        ? candidates
-            .slice()
-            .sort(
-              (a, b) =>
-                Math.hypot(a.x - taker.x, a.y - taker.y) -
-                Math.hypot(b.x - taker.x, b.y - taker.y)
-            )[0]
-        : undefined;
-
-      const targetMate =
-        shortDefender ??
-        candidates.find((p) => p.slotIndex >= 5 && p.slotIndex <= 8) ??
-        candidates[Math.floor(this.rng() * Math.max(1, candidates.length))];
-
-      const tx = targetMate ? targetMate.x : PITCH.HALF_X;
-      const ty = targetMate ? targetMate.y : PITCH.HALF_Y + (this.rng() - 0.5) * 18;
-      if (shortDefender) {
-        this.kickBallToward(taker, tx, ty, 15.5, 0.35, true, 'colocado');
+      if (preferShortOption) {
+        this.executeGoalKickAimShortPass();
       } else {
-        this.kickBallToward(taker, tx, ty, 23.5, 5.4, true, 'globo');
+        this.executeAiGoalKickFromAim(taker);
       }
-      if (taker.side === this.userSide && targetMate) {
-        this.activeUserPlayerId = targetMate.id;
-      } else if (this.twoPlayerMode && taker.side === 'away' && targetMate) {
-        this.activeUser2PlayerId = targetMate.id;
-      }
-      const gkTeam = taker.side === 'home' ? this.homeTeam.name : this.awayTeam.name;
-      this.onCommentary?.({
-        type: 'pass',
-        playerName: taker.player.name,
-        teamName: gkTeam,
-      });
       return;
     }
 
@@ -4289,7 +4980,10 @@ export class MatchEngine {
     if (!outState || !subPlayer || outState.redCard) return false;
 
     const outName = outState.player.name;
-    outState.player = subPlayer;
+    const sideIsTitan = side === 'home' ? this.homeIsRacingTitans : this.awayIsRacingTitans;
+    outState.player = sideIsTitan ? upgradePlayerToRacingTitan(subPlayer) : subPlayer;
+    outState.isRacingTitan = sideIsTitan;
+    outState.titanScale = sideIsTitan ? RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE : 1.0;
     outState.stamina = 100;
     outState.yellowCards = 0;
     outState.injured = false;
@@ -4806,7 +5500,7 @@ export class MatchEngine {
    * de posición, rotación, estado de animación esquelética de todos los jugadores y del balón.
    */
   private recordReplayFrame(): void {
-    this.replaySampleTick = (this.replaySampleTick + 1) % 3;
+    this.replaySampleTick = (this.replaySampleTick + 1) % 2;
     if (this.replaySampleTick !== 0 && !this.frameSoundEvent && this.replayBuffer.length > 24) {
       return;
     }
@@ -4842,8 +5536,8 @@ export class MatchEngine {
         number: p.player.number,
       })),
     });
-    if (this.replayBuffer.length > 240) {
-      this.replayBuffer.splice(0, 40);
+    if (this.replayBuffer.length > 540) {
+      this.replayBuffer.splice(0, 60);
     }
   }
 
@@ -4868,5 +5562,107 @@ export class MatchEngine {
       events: [...this.events],
       userSide: this.userSide,
     };
+  }
+
+  /**
+   * Serializa el estado completo del partido en un paquete ligero para sincronización Multijugador Online a 30Hz.
+   */
+  public serializeOnlineSnapshot() {
+    return {
+      t: Date.now(),
+      phase: this.phase,
+      half: this.half,
+      matchMinute: Number(this.matchMinute.toFixed(3)),
+      addedTime: this.addedTimeMinutes,
+      homeScore: this.homeScore,
+      awayScore: this.awayScore,
+      activeUserPlayerId: this.activeUserPlayerId,
+      activeUser2PlayerId: this.activeUser2PlayerId,
+      bannerText: this.bannerText,
+      bannerTimer: Number(this.bannerTimer.toFixed(2)),
+      ball: {
+        x: Number(this.ball.x.toFixed(3)),
+        y: Number(this.ball.y.toFixed(3)),
+        z: Number(this.ball.z.toFixed(3)),
+        vx: Number(this.ball.vx.toFixed(2)),
+        vy: Number(this.ball.vy.toFixed(2)),
+        vz: Number(this.ball.vz.toFixed(2)),
+        spin: Number((this.ball.spin ?? 0).toFixed(2)),
+        ownerId: this.ball.ownerId,
+        lastTouchTeam: this.ball.lastTouchTeam,
+      },
+      players: this.players.map((p) => ({
+        id: p.id,
+        x: Number(p.x.toFixed(3)),
+        y: Number(p.y.toFixed(3)),
+        vx: Number(p.vx.toFixed(2)),
+        vy: Number(p.vy.toFixed(2)),
+        facing: Number(p.facing.toFixed(3)),
+        stamina: Math.round(p.stamina),
+        animState: p.animState,
+        stridePhase: Number(p.stridePhase.toFixed(2)),
+        kickAnimTimer: Number(p.kickAnimTimer.toFixed(2)),
+        slideTimer: Number(p.slideTimer.toFixed(2)),
+        diveTimer: Number(p.diveTimer.toFixed(2)),
+        diveDirY: p.diveDirY,
+        yellowCards: p.yellowCards,
+        redCard: p.redCard,
+      })),
+    };
+  }
+
+  /**
+   * Aplica suavemente con interpolación un paquete de estado online recibido desde el servidor/anfitrión.
+   */
+  public applyOnlineSnapshot(snap: ReturnType<MatchEngine['serializeOnlineSnapshot']>, lerpAlpha = 0.45): void {
+    if (!snap) return;
+    this.phase = snap.phase;
+    this.half = snap.half;
+    this.matchMinute = snap.matchMinute;
+    this.addedTimeMinutes = snap.addedTime;
+    this.homeScore = snap.homeScore;
+    this.awayScore = snap.awayScore;
+    if (snap.activeUserPlayerId) this.activeUserPlayerId = snap.activeUserPlayerId;
+    if (snap.activeUser2PlayerId) this.activeUser2PlayerId = snap.activeUser2PlayerId;
+    this.bannerText = snap.bannerText;
+    this.bannerTimer = snap.bannerTimer;
+
+    if (snap.ball) {
+      const bDist = Math.hypot(snap.ball.x - this.ball.x, snap.ball.y - this.ball.y);
+      const bAlpha = bDist > 12 ? 1 : Math.min(1, lerpAlpha * 1.25);
+      this.ball.x += (snap.ball.x - this.ball.x) * bAlpha;
+      this.ball.y += (snap.ball.y - this.ball.y) * bAlpha;
+      this.ball.z += (snap.ball.z - this.ball.z) * bAlpha;
+      this.ball.vx = snap.ball.vx;
+      this.ball.vy = snap.ball.vy;
+      this.ball.vz = snap.ball.vz;
+      this.ball.spin = snap.ball.spin;
+      this.ball.ownerId = snap.ball.ownerId;
+      this.ball.lastTouchTeam = snap.ball.lastTouchTeam;
+    }
+
+    if (Array.isArray(snap.players)) {
+      for (const sp of snap.players) {
+        const local = this.players.find((p) => p.id === sp.id);
+        if (!local) continue;
+        const pDist = Math.hypot(sp.x - local.x, sp.y - local.y);
+        const pAlpha = pDist > 10 ? 1 : lerpAlpha;
+        local.x += (sp.x - local.x) * pAlpha;
+        local.y += (sp.y - local.y) * pAlpha;
+        local.vx = sp.vx;
+        local.vy = sp.vy;
+        const angleDiff = Math.atan2(Math.sin(sp.facing - local.facing), Math.cos(sp.facing - local.facing));
+        local.facing = Math.atan2(Math.sin(local.facing + angleDiff * pAlpha), Math.cos(local.facing + angleDiff * pAlpha));
+        local.stamina = sp.stamina;
+        local.animState = sp.animState;
+        local.stridePhase = sp.stridePhase;
+        local.kickAnimTimer = sp.kickAnimTimer;
+        local.slideTimer = sp.slideTimer;
+        local.diveTimer = sp.diveTimer;
+        local.diveDirY = sp.diveDirY;
+        local.yellowCards = sp.yellowCards;
+        local.redCard = sp.redCard;
+      }
+    }
   }
 }

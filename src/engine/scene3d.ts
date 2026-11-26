@@ -1,7 +1,12 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { CoachMood, MatchEngine } from './matchEngine';
-import { PITCH } from './physics';
+import {
+  EXPANDED_PITCH_SCALE,
+  PITCH,
+  RACING_TITANS_CONFIG,
+  isRacingTitansMasterFlagEnabled,
+} from './physics';
 import type {
   BeardType,
   GameSettings,
@@ -12,10 +17,32 @@ import type {
   Team,
 } from '../types/football';
 
+export interface StadiumPerformanceTelemetry {
+  fps: number;
+  frameTimeMs: number;
+  targetFps: number;
+  renderScalePct: number;
+  drawCalls: number;
+  triangles: number;
+  pitchDimensionsM: string;
+  pitchScaleFactor: number;
+  stadiumCapacity: number;
+  gpuInstancedCrowdCount: number;
+  billboardCrowdCount: number;
+  lightTowerCount: number;
+  activeSectors: number;
+  culledSectors: number;
+  timeOfDay: GameSettings['match']['timeOfDay'];
+  qualityTier: GameSettings['visual']['quality'];
+  isSoftwareGl: boolean;
+}
+
 export interface MatchScene3DController {
   renderer: THREE.WebGLRenderer;
   isSoftwareGl: boolean;
   updateTeamKits: (homeTeam: Team, awayTeam: Team, homeKit: KitSelection, awayKit: KitSelection) => void;
+  setTimeOfDay: (timeOfDay: GameSettings['match']['timeOfDay']) => void;
+  getPerformanceTelemetry: () => StadiumPerformanceTelemetry;
   updateAndRender: (
     eng: MatchEngine,
     dt: number,
@@ -27,6 +54,27 @@ export interface MatchScene3DController {
   resize: (width: number, height: number) => void;
   dispose: () => void;
 }
+
+/**
+ * 140 x 90 m Expanded World-Space Pitch Constants (Proportional to configurable EXPANDED_PITCH_SCALE)
+ */
+export const WORLD_PITCH = {
+  LENGTH: EXPANDED_PITCH_SCALE.TARGET_LENGTH_M, // 140 m
+  WIDTH: EXPANDED_PITCH_SCALE.TARGET_WIDTH_M, // 90 m
+  HALF_X: EXPANDED_PITCH_SCALE.TARGET_LENGTH_M / 2, // 70 m
+  HALF_Z: EXPANDED_PITCH_SCALE.TARGET_WIDTH_M / 2, // 45 m
+  SCALE_X: EXPANDED_PITCH_SCALE.FACTOR_X, // 140 / 105 = 1.333333
+  SCALE_Z: EXPANDED_PITCH_SCALE.FACTOR_Y, // 90 / 68 = 1.323529
+  GOAL_HALF: PITCH.GOAL_HALF * EXPANDED_PITCH_SCALE.FACTOR_Y,
+  GOAL_HEIGHT: PITCH.GOAL_HEIGHT,
+  GOAL_DEPTH: PITCH.GOAL_DEPTH * EXPANDED_PITCH_SCALE.FACTOR_X,
+  PENALTY_AREA_X: PITCH.PENALTY_AREA_X * EXPANDED_PITCH_SCALE.FACTOR_X, // 22.0 m
+  PENALTY_AREA_HALF_Z: PITCH.PENALTY_AREA_HALF_Y * EXPANDED_PITCH_SCALE.FACTOR_Y, // 26.68 m
+  SIX_YARD_X: PITCH.SIX_YARD_X * EXPANDED_PITCH_SCALE.FACTOR_X, // 7.33 m
+  SIX_YARD_HALF_Z: PITCH.SIX_YARD_HALF_Y * EXPANDED_PITCH_SCALE.FACTOR_Y, // 12.12 m
+  PENALTY_SPOT_X: PITCH.PENALTY_SPOT_X * EXPANDED_PITCH_SCALE.FACTOR_X, // 14.67 m
+  CENTER_CIRCLE_R: PITCH.CENTER_CIRCLE_R * EXPANDED_PITCH_SCALE.FACTOR_X, // 12.20 m
+} as const;
 
 interface PlayerRig3D {
   id: string;
@@ -44,6 +92,8 @@ interface PlayerRig3D {
   overheadCursor: THREE.Mesh;
   directionArrow: THREE.Mesh;
   cardMesh?: THREE.Mesh;
+  baseScaleY: number;
+  baseScaleXZ: number;
 }
 
 const SKIN_TONES = [0xf5d0b5, 0xe8b896, 0xd49b72, 0xb87b52, 0x8d5524, 0x5c3818];
@@ -105,11 +155,11 @@ function hashString(str: string): number {
 }
 
 function physToWorldX(x: number): number {
-  return x - PITCH.HALF_X;
+  return (x - PITCH.HALF_X) * WORLD_PITCH.SCALE_X;
 }
 
 function physToWorldZ(y: number): number {
-  return y - PITCH.HALF_Y;
+  return (y - PITCH.HALF_Y) * WORLD_PITCH.SCALE_Z;
 }
 
 const turfTextureCache = new Map<
@@ -658,61 +708,66 @@ function createPitchMarkingsGroup(): THREE.Group {
     group.add(top, bot, left, right);
   };
 
-  // Outer pitch boundary (105 x 68)
-  addLineRect(0, 0, PITCH.LENGTH, PITCH.WIDTH);
+  // Outer pitch boundary (140 x 90 m expanded surface)
+  addLineRect(0, 0, WORLD_PITCH.LENGTH, WORLD_PITCH.WIDTH);
 
   // Technical Areas (Áreas Técnicas) along North touchline for Home & Away Coaches
-  addLineRect(-11, -PITCH.HALF_Y - 1.2, 8.5, 1.8);
-  addLineRect(11, -PITCH.HALF_Y - 1.2, 8.5, 1.8);
+  addLineRect(-14.6, -WORLD_PITCH.HALF_Z - 1.5, 11.2, 2.2);
+  addLineRect(14.6, -WORLD_PITCH.HALF_Z - 1.5, 11.2, 2.2);
 
   // Halfway line
-  const halfGeo = new THREE.PlaneGeometry(LW, PITCH.WIDTH);
+  const halfGeo = new THREE.PlaneGeometry(LW, WORLD_PITCH.WIDTH);
   halfGeo.rotateX(-Math.PI / 2);
   const halfLine = new THREE.Mesh(halfGeo, lineMat);
   halfLine.position.set(0, Y, 0);
   group.add(halfLine);
 
-  // Center Circle & Spot
-  const circleGeo = new THREE.RingGeometry(PITCH.CENTER_CIRCLE_R - LW / 2, PITCH.CENTER_CIRCLE_R + LW / 2, 64);
+  // Proportional Center Circle (R = 12.20 m) & Spot
+  const circleGeo = new THREE.RingGeometry(
+    WORLD_PITCH.CENTER_CIRCLE_R - LW / 2,
+    WORLD_PITCH.CENTER_CIRCLE_R + LW / 2,
+    64
+  );
   circleGeo.rotateX(-Math.PI / 2);
   const centerCircle = new THREE.Mesh(circleGeo, lineMat);
   centerCircle.position.set(0, Y, 0);
   group.add(centerCircle);
 
-  const spotGeo = new THREE.CircleGeometry(0.26, 20);
+  const spotGeo = new THREE.CircleGeometry(0.32, 20);
   spotGeo.rotateX(-Math.PI / 2);
   const centerSpot = new THREE.Mesh(spotGeo, lineMat);
   centerSpot.position.set(0, Y, 0);
   group.add(centerSpot);
 
-  // Left & Right Penalty Boxes & 6-Yard Goal Areas
-  const penW = PITCH.PENALTY_AREA_X;
-  const penH = PITCH.PENALTY_AREA_HALF_Y * 2;
-  addLineRect(-PITCH.HALF_X + penW / 2, 0, penW, penH);
-  addLineRect(PITCH.HALF_X - penW / 2, 0, penW, penH);
+  // Proportional Left & Right Penalty Boxes (22.0m x 53.36m) & 6-Yard Goal Areas (7.33m x 24.25m)
+  const penW = WORLD_PITCH.PENALTY_AREA_X;
+  const penH = WORLD_PITCH.PENALTY_AREA_HALF_Z * 2;
+  addLineRect(-WORLD_PITCH.HALF_X + penW / 2, 0, penW, penH);
+  addLineRect(WORLD_PITCH.HALF_X - penW / 2, 0, penW, penH);
 
-  const goalAreaW = PITCH.SIX_YARD_X;
-  const goalAreaH = PITCH.SIX_YARD_HALF_Y * 2;
-  addLineRect(-PITCH.HALF_X + goalAreaW / 2, 0, goalAreaW, goalAreaH);
-  addLineRect(PITCH.HALF_X - goalAreaW / 2, 0, goalAreaW, goalAreaH);
+  const goalAreaW = WORLD_PITCH.SIX_YARD_X;
+  const goalAreaH = WORLD_PITCH.SIX_YARD_HALF_Z * 2;
+  addLineRect(-WORLD_PITCH.HALF_X + goalAreaW / 2, 0, goalAreaW, goalAreaH);
+  addLineRect(WORLD_PITCH.HALF_X - goalAreaW / 2, 0, goalAreaW, goalAreaH);
 
-  // Penalty Spots
+  // Penalty Spots (14.67m from goal line)
   const leftPenSpot = new THREE.Mesh(spotGeo, lineMat);
-  leftPenSpot.position.set(-PITCH.HALF_X + PITCH.PENALTY_SPOT_X, Y, 0);
+  leftPenSpot.position.set(-WORLD_PITCH.HALF_X + WORLD_PITCH.PENALTY_SPOT_X, Y, 0);
   const rightPenSpot = new THREE.Mesh(spotGeo, lineMat);
-  rightPenSpot.position.set(PITCH.HALF_X - PITCH.PENALTY_SPOT_X, Y, 0);
+  rightPenSpot.position.set(WORLD_PITCH.HALF_X - WORLD_PITCH.PENALTY_SPOT_X, Y, 0);
   group.add(leftPenSpot, rightPenSpot);
 
-  // Penalty Arcs
-  const leftArcGeo = new THREE.RingGeometry(9.15 - LW / 2, 9.15 + LW / 2, 40, 1, -0.92, 1.84);
+  // Proportional Penalty Arcs (R = 12.20 m)
+  const arcR = WORLD_PITCH.CENTER_CIRCLE_R;
+  const leftArcGeo = new THREE.RingGeometry(arcR - LW / 2, arcR + LW / 2, 40, 1, -0.92, 1.84);
   leftArcGeo.rotateX(-Math.PI / 2);
   const leftArc = new THREE.Mesh(leftArcGeo, lineMat);
-  leftArc.position.set(-PITCH.HALF_X + PITCH.PENALTY_SPOT_X, Y, 0);
+  leftArc.position.set(-WORLD_PITCH.HALF_X + WORLD_PITCH.PENALTY_SPOT_X, Y, 0);
 
-  const rightArcGeo = new THREE.RingGeometry(9.15 - LW / 2, 9.15 + LW / 2, 40, 1, Math.PI - 0.92, 1.84);
+  const rightArcGeo = new THREE.RingGeometry(arcR - LW / 2, arcR + LW / 2, 40, 1, Math.PI - 0.92, 1.84);
   rightArcGeo.rotateX(-Math.PI / 2);
   const rightArc = new THREE.Mesh(rightArcGeo, lineMat);
-  rightArc.position.set(PITCH.HALF_X - PITCH.PENALTY_SPOT_X, Y, 0);
+  rightArc.position.set(WORLD_PITCH.HALF_X - WORLD_PITCH.PENALTY_SPOT_X, Y, 0);
   group.add(leftArc, rightArc);
 
   // Corner Arcs & 4 Corner Flags in 3D
@@ -722,10 +777,10 @@ function createPitchMarkingsGroup(): THREE.Group {
   const flagMat = new THREE.MeshStandardMaterial({ color: 0xef4444, side: THREE.DoubleSide, roughness: 0.5 });
 
   const corners = [
-    [-PITCH.HALF_X, -PITCH.HALF_Y],
-    [PITCH.HALF_X, -PITCH.HALF_Y],
-    [-PITCH.HALF_X, PITCH.HALF_Y],
-    [PITCH.HALF_X, PITCH.HALF_Y],
+    [-WORLD_PITCH.HALF_X, -WORLD_PITCH.HALF_Z],
+    [WORLD_PITCH.HALF_X, -WORLD_PITCH.HALF_Z],
+    [-WORLD_PITCH.HALF_X, WORLD_PITCH.HALF_Z],
+    [WORLD_PITCH.HALF_X, WORLD_PITCH.HALF_Z],
   ];
   for (const [cx, cz] of corners) {
     const pole = new THREE.Mesh(poleGeo, poleMat);
@@ -772,10 +827,10 @@ function createGoalNetTexture(): THREE.CanvasTexture {
 function create3DGoal(side: 'left' | 'right'): { group: THREE.Group; netMeshes: THREE.Mesh[] } {
   const group = new THREE.Group();
   const dir = side === 'left' ? -1 : 1;
-  const goalX = dir * PITCH.HALF_X;
-  const H = PITCH.GOAL_HEIGHT;
-  const halfW = PITCH.GOAL_HALF;
-  const depth = PITCH.GOAL_DEPTH;
+  const goalX = dir * WORLD_PITCH.HALF_X;
+  const H = WORLD_PITCH.GOAL_HEIGHT;
+  const halfW = WORLD_PITCH.GOAL_HALF;
+  const depth = WORLD_PITCH.GOAL_DEPTH;
 
   const postMat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -1084,6 +1139,69 @@ function createCrowdBackdropTexture(homeTeam: Team): THREE.CanvasTexture {
   return tex;
 }
 
+export interface CullableStadiumSector {
+  name: string;
+  group: THREE.Object3D;
+  bounds: THREE.Sphere;
+}
+
+export interface CrowdGpuShaderController {
+  uTime: { value: number };
+  uWaveAmp: { value: number };
+  uWaveSpeed: { value: number };
+}
+
+/**
+ * Merges an array of positioned BoxGeometries into a single BufferGeometry (1 draw call)
+ * for ultra-low draw call modular stadium and exterior city construction.
+ */
+function mergeBoxBoxesToSingleGeometry(
+  boxes: { w: number; h: number; d: number; x: number; y: number; z: number }[]
+): THREE.BufferGeometry {
+  const templates = boxes.map((b) => {
+    const g = new THREE.BoxGeometry(b.w, b.h, b.d);
+    g.translate(b.x, b.y, b.z);
+    return g;
+  });
+  let totalVerts = 0;
+  let totalIndices = 0;
+  for (const g of templates) {
+    totalVerts += g.attributes.position.count;
+    totalIndices += g.index!.count;
+  }
+  const positions = new Float32Array(totalVerts * 3);
+  const normals = new Float32Array(totalVerts * 3);
+  const uvs = new Float32Array(totalVerts * 2);
+  const indices = new Uint32Array(totalIndices);
+
+  let vOffset = 0;
+  let iOffset = 0;
+  for (const g of templates) {
+    const pos = g.attributes.position.array as Float32Array;
+    const norm = g.attributes.normal.array as Float32Array;
+    const uv = g.attributes.uv.array as Float32Array;
+    const idx = g.index!.array;
+
+    positions.set(pos, vOffset * 3);
+    normals.set(norm, vOffset * 3);
+    uvs.set(uv, vOffset * 2);
+    for (let k = 0; k < idx.length; k++) {
+      indices[iOffset + k] = idx[k] + vOffset;
+    }
+    vOffset += g.attributes.position.count;
+    iOffset += idx.length;
+    g.dispose();
+  }
+
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  merged.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  merged.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  merged.setIndex(new THREE.BufferAttribute(indices, 1));
+  merged.computeBoundingSphere();
+  return merged;
+}
+
 function create3DStadiumAndCrowd(
   homeTeam: Team,
   awayTeam: Team,
@@ -1093,14 +1211,29 @@ function create3DStadiumAndCrowd(
 ): {
   stadiumGroup: THREE.Group;
   crowdMesh: THREE.InstancedMesh;
+  crowdBillboardMesh: THREE.InstancedMesh;
   flagsMesh: THREE.InstancedMesh;
   flaresGroup: THREE.Group;
   cameraFlashes: THREE.Points;
   updateJumbotron: (homeScore: number, awayScore: number, minute: number) => void;
   crowdBasePositions: { x: number; y: number; z: number; phase: number }[];
   flagBasePositions: { x: number; y: number; z: number; phase: number }[];
+  cullableSectors: CullableStadiumSector[];
+  towerLodObjects: THREE.LOD[];
+  lampHeadMat: THREE.MeshBasicMaterial;
+  crowdShaderCtrl: CrowdGpuShaderController;
+  nearCrowdCount: number;
+  billboardCrowdCount: number;
 } {
   const stadiumGroup = new THREE.Group();
+
+  // 5 Frustum-Cullable Sectors (North, South, East, West, Exterior City)
+  const northSector = new THREE.Group();
+  const southSector = new THREE.Group();
+  const eastSector = new THREE.Group();
+  const westSector = new THREE.Group();
+  const citySector = new THREE.Group();
+  stadiumGroup.add(northSector, southSector, eastSector, westSector, citySector);
 
   const themeAccentHex =
     stadiumThemeId === 'stadium_royal_gold'
@@ -1129,29 +1262,34 @@ function create3DStadiumAndCrowd(
   });
   const roofMat = getSharedLambertMaterial(themeRoofHex);
 
-  // 1. Continuous Unbroken Glowing LED Perimeter Ad Boards close to the touchlines & goal lines
+  const HX = WORLD_PITCH.HALF_X; // 70 m
+  const HZ = WORLD_PITCH.HALF_Z; // 45 m
+
+  // 1. Continuous Glowing LED Perimeter Ad Boards around the 140 x 90 m pitch
   const adTex = createAdvertisingBoardTexture(homeTeam, awayTeam);
   const adMat = new THREE.MeshBasicMaterial({ map: adTex });
   const adBackingMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.7 });
 
-  // North touchline LED board (100% continuous across the top of the broadcast frame)
-  const northAd = new THREE.Mesh(new THREE.BoxGeometry(110.8, 1.22, 0.32), adMat);
-  northAd.position.set(0, 0.61, -35.8);
+  const northAd = new THREE.Mesh(new THREE.BoxGeometry(146.4, 1.25, 0.34), adMat);
+  northAd.position.set(0, 0.62, -HZ - 2.2);
   northAd.rotation.x = 0.08;
-  // East goal-line LED board (visible behind the right goal in the broadcast frame)
-  const eastAd = new THREE.Mesh(new THREE.BoxGeometry(0.32, 1.22, 72.4), adMat);
-  eastAd.position.set(55.2, 0.61, 0);
-  eastAd.rotation.z = 0.08;
-  // West goal-line LED board
-  const westAd = new THREE.Mesh(new THREE.BoxGeometry(0.32, 1.22, 72.4), adMat);
-  westAd.position.set(-55.2, 0.61, 0);
-  westAd.rotation.z = -0.08;
-  // South touchline low LED board
-  const southAd = new THREE.Mesh(new THREE.BoxGeometry(110.8, 0.95, 0.32), adBackingMat);
-  southAd.position.set(0, 0.48, 36.6);
-  stadiumGroup.add(northAd, eastAd, westAd, southAd);
+  northSector.add(northAd);
 
-  // 2. Pitchside Details: Stewards & Photographers in High-Vis Vests + Broadcast Microphones
+  const eastAd = new THREE.Mesh(new THREE.BoxGeometry(0.34, 1.25, 94.8), adMat);
+  eastAd.position.set(HX + 3.2, 0.62, 0);
+  eastAd.rotation.z = 0.08;
+  eastSector.add(eastAd);
+
+  const westAd = new THREE.Mesh(new THREE.BoxGeometry(0.34, 1.25, 94.8), adMat);
+  westAd.position.set(-HX - 3.2, 0.62, 0);
+  westAd.rotation.z = -0.08;
+  westSector.add(westAd);
+
+  const southAd = new THREE.Mesh(new THREE.BoxGeometry(146.4, 0.98, 0.34), adBackingMat);
+  southAd.position.set(0, 0.49, HZ + 3.0);
+  southSector.add(southAd);
+
+  // 2. Pitchside Details: Stewards, Photographers, Broadcast Mics, Dugouts & 3 Player Tunnels
   const stewardTorsoGeo = new THREE.CylinderGeometry(0.18, 0.2, 0.62, 8);
   const stewardHeadGeo = new THREE.SphereGeometry(0.14, 8, 8);
   const orangeVestMat = new THREE.MeshLambertMaterial({ color: 0xf97316 });
@@ -1159,7 +1297,7 @@ function create3DStadiumAndCrowd(
   const darkPantsMat = new THREE.MeshLambertMaterial({ color: 0x1e293b });
   const skinStewardMat = new THREE.MeshLambertMaterial({ color: 0xe8b896 });
 
-  const addPitchsidePerson = (px: number, pz: number, rotY: number, isOrange: boolean) => {
+  const addPitchsidePerson = (targetGroup: THREE.Group, px: number, pz: number, rotY: number, isOrange: boolean) => {
     const g = new THREE.Group();
     g.position.set(px, 0, pz);
     g.rotation.y = rotY;
@@ -1170,246 +1308,150 @@ function create3DStadiumAndCrowd(
     const head = new THREE.Mesh(stewardHeadGeo, skinStewardMat);
     head.position.y = 1.24;
     g.add(base, vest, head);
-    stadiumGroup.add(g);
+    targetGroup.add(g);
   };
 
-  for (let x = -48; x <= 48; x += 9.6) {
-    addPitchsidePerson(x, -35.1, 0, Math.abs(x) % 19 < 9);
+  for (let x = -62; x <= 62; x += 12.4) {
+    addPitchsidePerson(northSector, x, -HZ - 1.5, 0, Math.abs(x) % 24 < 12);
   }
-  for (const z of [-28, -20, -12, 8, 15, 22, 29]) {
-    addPitchsidePerson(54.3, z, -Math.PI / 2, z > 0);
-    addPitchsidePerson(-54.3, z, Math.PI / 2, z < 0);
-  }
-
-  // Pitchside Broadcast Directional Microphones along touchline & goal line
-  const micStandMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.6 });
-  const micFoamMat = new THREE.MeshStandardMaterial({ color: 0x475569, roughness: 0.9 });
-  const addBroadcastMic = (mx: number, mz: number, rotY: number) => {
-    const mg = new THREE.Group();
-    mg.position.set(mx, 0, mz);
-    mg.rotation.y = rotY;
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.05, 0.55, 6), micStandMat);
-    pole.position.y = 0.27;
-    const mic = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.16, 0.16), micFoamMat);
-    mic.position.set(0, 0.56, 0.05);
-    mic.rotation.x = -0.25;
-    mg.add(pole, mic);
-    stadiumGroup.add(mg);
-  };
-  for (const mx of [-38, -20, 20, 38]) {
-    addBroadcastMic(mx, -34.8, 0);
-  }
-  for (const mz of [-14, 10, 21]) {
-    addBroadcastMic(53.8, mz, -Math.PI / 2);
-    addBroadcastMic(-53.8, mz, Math.PI / 2);
+  for (const z of [-36, -24, -12, 10, 22, 34]) {
+    addPitchsidePerson(eastSector, HX + 2.3, z, -Math.PI / 2, z > 0);
+    addPitchsidePerson(westSector, -HX - 2.3, z, Math.PI / 2, z < 0);
   }
 
-  // Technical Area Dugouts + Central Locker-Room Player Entrance Tunnel (Túnel de Vestuarios)
   const dugoutMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.4, metalness: 0.3 });
   const benchSeatMat = new THREE.MeshStandardMaterial({ color: themeAccentHex, roughness: 0.6 });
-  for (const bx of [-14, 14]) {
-    const shelter = new THREE.Mesh(new THREE.BoxGeometry(6.4, 1.8, 1.4), dugoutMat);
-    shelter.position.set(bx, 1.35, -37.2);
-    const bench = new THREE.Mesh(new THREE.BoxGeometry(5.8, 0.5, 0.7), benchSeatMat);
-    bench.position.set(bx, 0.8, -36.9);
-    stadiumGroup.add(shelter, bench);
+  for (const bx of [-18, 18]) {
+    const shelter = new THREE.Mesh(new THREE.BoxGeometry(7.6, 1.9, 1.6), dugoutMat);
+    shelter.position.set(bx, 1.38, -HZ - 3.6);
+    const bench = new THREE.Mesh(new THREE.BoxGeometry(6.8, 0.55, 0.8), benchSeatMat);
+    bench.position.set(bx, 0.82, -HZ - 3.3);
+    northSector.add(shelter, bench);
   }
-  const centralTunnelFrame = new THREE.Mesh(new THREE.BoxGeometry(5.2, 3.2, 2.4), tierRedWallMat);
-  centralTunnelFrame.position.set(0, 1.6, -38.0);
-  const centralTunnelVoid = new THREE.Mesh(new THREE.BoxGeometry(4.2, 2.6, 2.6), darkTunnelMat);
-  centralTunnelVoid.position.set(0, 1.3, -37.9);
-  stadiumGroup.add(centralTunnelFrame, centralTunnelVoid);
 
-  // 3. MONUMENTAL 3-TIER STADIUM COLOSSEUM (Bandeja Baja, Bandeja Media VIP & Bandeja Alta Monumental on all 4 sides)
-  const stepsTier1 = 8; // Bandeja Baja (1.1m -> 10m)
+  // Central Player Tunnel + 2 Corner Vomitory Tunnels
+  const centralTunnelFrame = new THREE.Mesh(new THREE.BoxGeometry(6.2, 3.5, 2.8), tierRedWallMat);
+  centralTunnelFrame.position.set(0, 1.75, -HZ - 4.4);
+  const centralTunnelVoid = new THREE.Mesh(new THREE.BoxGeometry(5.0, 2.8, 3.0), darkTunnelMat);
+  centralTunnelVoid.position.set(0, 1.4, -HZ - 4.3);
+  northSector.add(centralTunnelFrame, centralTunnelVoid);
+
+  // 3. MONUMENTAL 80,000-SPECTATOR 3-TIER MODULAR STADIUM (Merged per sector for < 15 draw calls!)
+  const stepsTier1 = 8; // Bandeja Baja (1.2m -> 11.2m)
+  const stepsTier2 = 6; // Bandeja Media VIP (13.6m -> 22.8m)
+  const stepsTier3 = 7; // Bandeja Alta Monumental (25.2m -> 37.8m)
+
+  const northBoxes: { w: number; h: number; d: number; x: number; y: number; z: number }[] = [];
+  const southBoxes: { w: number; h: number; d: number; x: number; y: number; z: number }[] = [];
+  const eastBoxes: { w: number; h: number; d: number; x: number; y: number; z: number }[] = [];
+  const westBoxes: { w: number; h: number; d: number; x: number; y: number; z: number }[] = [];
+
   for (let s = 0; s < stepsTier1; s++) {
-    const stepH = 1.15 + s * 1.18;
+    const stepH = 1.2 + s * 1.24;
     const stepY = stepH / 2;
-    const distOffset = s * 1.48;
-
-    const nStep = new THREE.Mesh(
-      new THREE.BoxGeometry(114 + distOffset * 2, stepH, 1.68),
-      standMat
-    );
-    nStep.position.set(0, stepY, -37.2 - distOffset);
-
-    const eStep = new THREE.Mesh(
-      new THREE.BoxGeometry(1.68, stepH, 75 + distOffset * 2),
-      standMat
-    );
-    eStep.position.set(56.6 + distOffset, stepY, 0);
-
-    const wStep = new THREE.Mesh(
-      new THREE.BoxGeometry(1.68, stepH, 75 + distOffset * 2),
-      standMat
-    );
-    wStep.position.set(-56.6 - distOffset, stepY, 0);
-
-    stadiumGroup.add(nStep, eStep, wStep);
+    const distOffset = s * 1.55;
+    northBoxes.push({ w: 150 + distOffset * 2, h: stepH, d: 1.75, x: 0, y: stepY, z: -HZ - 3.8 - distOffset });
+    southBoxes.push({ w: 150 + distOffset * 2, h: stepH, d: 1.75, x: 0, y: stepY, z: HZ + 5.2 + distOffset });
+    eastBoxes.push({ w: 1.75, h: stepH, d: 98 + distOffset * 2, x: HX + 4.8 + distOffset, y: stepY, z: 0 });
+    westBoxes.push({ w: 1.75, h: stepH, d: 98 + distOffset * 2, x: -HX - 4.8 - distOffset, y: stepY, z: 0 });
   }
 
-  // Bandeja Media (Anillo de Palcos VIP Iluminados + Fascia LED + 6 Gradas Intermedias: 11.5m -> 21.5m)
-  const vipNorthWall = new THREE.Mesh(new THREE.BoxGeometry(138, 2.4, 2.2), vipGlassMat);
-  vipNorthWall.position.set(0, 11.4, -49.2);
-  const vipEastWall = new THREE.Mesh(new THREE.BoxGeometry(2.2, 2.4, 98), vipGlassMat);
-  vipEastWall.position.set(68.6, 11.4, 0);
-  const vipWestWall = new THREE.Mesh(new THREE.BoxGeometry(2.2, 2.4, 98), vipGlassMat);
-  vipWestWall.position.set(-68.6, 11.4, 0);
-  const vipNorthFascia = new THREE.Mesh(new THREE.BoxGeometry(139, 0.9, 0.5), adMat);
-  vipNorthFascia.position.set(0, 12.6, -48.0);
-  const vipEastFascia = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.9, 99), adMat);
-  vipEastFascia.position.set(67.4, 12.6, 0);
-  const vipWestFascia = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.9, 99), adMat);
-  vipWestFascia.position.set(-67.4, 12.6, 0);
-  stadiumGroup.add(
-    vipNorthWall,
-    vipEastWall,
-    vipWestWall,
-    vipNorthFascia,
-    vipEastFascia,
-    vipWestFascia
-  );
-
-  const stepsTier2 = 6; // Bandeja Media (13.2m -> 21.6m)
   for (let s = 0; s < stepsTier2; s++) {
-    const stepY = 13.2 + s * 1.42;
-    const distOffset = 12.5 + s * 1.65;
-
-    const nStep = new THREE.Mesh(
-      new THREE.BoxGeometry(138 + s * 3.5, 1.55, 1.85),
-      standMat
-    );
-    nStep.position.set(0, stepY, -37.2 - distOffset);
-
-    const eStep = new THREE.Mesh(
-      new THREE.BoxGeometry(1.85, 1.55, 98 + s * 3.5),
-      standMat
-    );
-    eStep.position.set(56.6 + distOffset, stepY, 0);
-
-    const wStep = new THREE.Mesh(
-      new THREE.BoxGeometry(1.85, 1.55, 98 + s * 3.5),
-      standMat
-    );
-    wStep.position.set(-56.6 - distOffset, stepY, 0);
-
-    // South Stand (Bandeja Sur detrás de la cámara principal para giros 360° de repetición)
-    const sStep = new THREE.Mesh(
-      new THREE.BoxGeometry(138 + s * 3.5, 1.55, 1.85),
-      standMat
-    );
-    sStep.position.set(0, stepY, 44.0 + distOffset);
-
-    stadiumGroup.add(nStep, eStep, wStep, sStep);
+    const stepY = 13.8 + s * 1.5;
+    const distOffset = 13.5 + s * 1.72;
+    northBoxes.push({ w: 176 + s * 3.8, h: 1.62, d: 1.9, x: 0, y: stepY, z: -HZ - 3.8 - distOffset });
+    southBoxes.push({ w: 176 + s * 3.8, h: 1.62, d: 1.9, x: 0, y: stepY, z: HZ + 5.2 + distOffset });
+    eastBoxes.push({ w: 1.9, h: 1.62, d: 124 + s * 3.8, x: HX + 4.8 + distOffset, y: stepY, z: 0 });
+    westBoxes.push({ w: 1.9, h: 1.62, d: 124 + s * 3.8, x: -HX - 4.8 - distOffset, y: stepY, z: 0 });
   }
 
-  // Bandeja Alta Monumental (Anillo Superior Colosal: 23.5m -> 35.5m)
-  const upperFasciaN = new THREE.Mesh(new THREE.BoxGeometry(162, 1.2, 0.6), tierRedWallMat);
-  upperFasciaN.position.set(0, 22.8, -59.5);
-  const upperFasciaE = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.2, 120), tierRedWallMat);
-  upperFasciaE.position.set(78.8, 22.8, 0);
-  const upperFasciaW = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.2, 120), tierRedWallMat);
-  upperFasciaW.position.set(-78.8, 22.8, 0);
-  stadiumGroup.add(upperFasciaN, upperFasciaE, upperFasciaW);
-
-  const stepsTier3 = 7;
   for (let s = 0; s < stepsTier3; s++) {
-    const stepY = 23.8 + s * 1.65;
-    const distOffset = 23.2 + s * 1.85;
-
-    const nStep = new THREE.Mesh(
-      new THREE.BoxGeometry(162 + s * 4.0, 1.75, 2.0),
-      standMat
-    );
-    nStep.position.set(0, stepY, -37.2 - distOffset);
-
-    const eStep = new THREE.Mesh(
-      new THREE.BoxGeometry(2.0, 1.75, 120 + s * 4.0),
-      standMat
-    );
-    eStep.position.set(56.6 + distOffset, stepY, 0);
-
-    const wStep = new THREE.Mesh(
-      new THREE.BoxGeometry(2.0, 1.75, 120 + s * 4.0),
-      standMat
-    );
-    wStep.position.set(-56.6 - distOffset, stepY, 0);
-
-    const sStep = new THREE.Mesh(
-      new THREE.BoxGeometry(162 + s * 4.0, 1.75, 2.0),
-      standMat
-    );
-    sStep.position.set(0, stepY, 44.0 + distOffset);
-
-    stadiumGroup.add(nStep, eStep, wStep, sStep);
+    const stepY = 25.2 + s * 1.75;
+    const distOffset = 25.0 + s * 1.95;
+    northBoxes.push({ w: 204 + s * 4.2, h: 1.85, d: 2.1, x: 0, y: stepY, z: -HZ - 3.8 - distOffset });
+    southBoxes.push({ w: 204 + s * 4.2, h: 1.85, d: 2.1, x: 0, y: stepY, z: HZ + 5.2 + distOffset });
+    eastBoxes.push({ w: 2.1, h: 1.85, d: 152 + s * 4.2, x: HX + 4.8 + distOffset, y: stepY, z: 0 });
+    westBoxes.push({ w: 2.1, h: 1.85, d: 152 + s * 4.2, x: -HX - 4.8 - distOffset, y: stepY, z: 0 });
   }
 
-  // Flush Stairway Aisles & Vomitory Entrance Tunnels
-  for (const ax of [-34, -8, 18, 42]) {
-    for (let s = 0; s < 5; s++) {
-      const stepY = 1.15 + s * 1.18;
-      const distOffset = s * 1.48;
-      const stairStep = new THREE.Mesh(new THREE.BoxGeometry(2.1, 0.25, 1.5), aisleMat);
-      stairStep.position.set(ax, stepY + 0.05, -37.2 - distOffset);
-      stadiumGroup.add(stairStep);
-    }
-    const tunnel = new THREE.Mesh(new THREE.BoxGeometry(2.8, 2.2, 1.6), darkTunnelMat);
-    tunnel.position.set(ax, 3.8, -40.2);
-    stadiumGroup.add(tunnel);
+  // Merge each quadrant's 21 tier steps into 1 single draw call per sector (4 draw calls total for all 3 tiers!)
+  northSector.add(new THREE.Mesh(mergeBoxBoxesToSingleGeometry(northBoxes), standMat));
+  southSector.add(new THREE.Mesh(mergeBoxBoxesToSingleGeometry(southBoxes), standMat));
+  eastSector.add(new THREE.Mesh(mergeBoxBoxesToSingleGeometry(eastBoxes), standMat));
+  westSector.add(new THREE.Mesh(mergeBoxBoxesToSingleGeometry(westBoxes), standMat));
+
+  // VIP Glass Ring & Fascia LED Ribbons
+  const vipNorthWall = new THREE.Mesh(new THREE.BoxGeometry(176, 2.5, 2.2), vipGlassMat);
+  vipNorthWall.position.set(0, 12.0, -HZ - 16.5);
+  const vipNorthFascia = new THREE.Mesh(new THREE.BoxGeometry(177, 0.95, 0.5), adMat);
+  vipNorthFascia.position.set(0, 13.2, -HZ - 15.3);
+  const upperFasciaN = new THREE.Mesh(new THREE.BoxGeometry(204, 1.3, 0.6), tierRedWallMat);
+  upperFasciaN.position.set(0, 24.0, -HZ - 28.0);
+  northSector.add(vipNorthWall, vipNorthFascia, upperFasciaN);
+
+  const vipEastWall = new THREE.Mesh(new THREE.BoxGeometry(2.2, 2.5, 124), vipGlassMat);
+  vipEastWall.position.set(HX + 17.5, 12.0, 0);
+  const vipEastFascia = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.95, 125), adMat);
+  vipEastFascia.position.set(HX + 16.3, 13.2, 0);
+  const upperFasciaE = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.3, 152), tierRedWallMat);
+  upperFasciaE.position.set(HX + 29.0, 24.0, 0);
+  eastSector.add(vipEastWall, vipEastFascia, upperFasciaE);
+
+  const vipWestWall = new THREE.Mesh(new THREE.BoxGeometry(2.2, 2.5, 124), vipGlassMat);
+  vipWestWall.position.set(-HX - 17.5, 12.0, 0);
+  const vipWestFascia = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.95, 125), adMat);
+  vipWestFascia.position.set(-HX - 16.3, 13.2, 0);
+  const upperFasciaW = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.3, 152), tierRedWallMat);
+  upperFasciaW.position.set(-HX - 29.0, 24.0, 0);
+  westSector.add(vipWestWall, vipWestFascia, upperFasciaW);
+
+  // Flush Stairway Aisles & Vomitory Tunnels on North Stand
+  for (const ax of [-44, -12, 20, 52]) {
+    const tunnel = new THREE.Mesh(new THREE.BoxGeometry(3.2, 2.4, 1.8), darkTunnelMat);
+    tunnel.position.set(ax, 4.2, -HZ - 7.0);
+    const stair = new THREE.Mesh(new THREE.BoxGeometry(2.2, 9.5, 11.5), aisleMat);
+    stair.position.set(ax, 5.2, -HZ - 9.2);
+    northSector.add(tunnel, stair);
   }
 
-  // Lower Executive Boxes behind the East & West Goals
-  for (const sideDir of [-1, 1]) {
-    const boxWall = new THREE.Mesh(new THREE.BoxGeometry(2.2, 2.2, 24), tierRedWallMat);
-    boxWall.position.set(sideDir * 57.6, 2.0, 14);
-    const redFrontBarrier = new THREE.Mesh(new THREE.BoxGeometry(0.35, 1.25, 73), tierRedWallMat);
-    redFrontBarrier.position.set(sideDir * 55.8, 0.9, 0);
-    stadiumGroup.add(boxWall, redFrontBarrier);
-  }
-
-  // Perimeter Wall behind North LED board
-  const northRedBarrier = new THREE.Mesh(new THREE.BoxGeometry(112, 1.25, 0.35), tierRedWallMat);
-  northRedBarrier.position.set(0, 0.9, -36.3);
-  stadiumGroup.add(northRedBarrier);
-
-  // Giant 3D Stadium Jumbotron Scoreboards (North Center + East & West Goal Ends + 2 Corner Screens)
+  // Giant 3D Stadium Jumbotron Scoreboards (North Center + East & West Goal Ends)
   const { texture: jumboTex, updateScoreboard: updateJumbotron } = createDynamicJumbotron(
     homeTeam,
     awayTeam
   );
   const jumboMat = new THREE.MeshBasicMaterial({ map: jumboTex });
-  const jumboGeo = new THREE.BoxGeometry(22, 7.6, 1.1);
-  const northJumbo = new THREE.Mesh(jumboGeo, jumboMat);
-  northJumbo.position.set(0, 34.5, -72.0);
+  const northJumbo = new THREE.Mesh(new THREE.BoxGeometry(26, 8.8, 1.2), jumboMat);
+  northJumbo.position.set(0, 38.5, -HZ - 41.5);
+  northSector.add(northJumbo);
 
-  // Giant Jumbotrons suspended behind the East & West Goals (Fondos del Estadio)
-  const eastJumbo = new THREE.Mesh(new THREE.BoxGeometry(1.1, 7.2, 20), jumboMat);
-  eastJumbo.position.set(89.5, 33.5, 0);
-  const westJumbo = new THREE.Mesh(new THREE.BoxGeometry(1.1, 7.2, 20), jumboMat);
-  westJumbo.position.set(-89.5, 33.5, 0);
+  const eastJumbo = new THREE.Mesh(new THREE.BoxGeometry(1.2, 8.2, 24), jumboMat);
+  eastJumbo.position.set(HX + 41.5, 37.5, 0);
+  eastSector.add(eastJumbo);
 
-  const nwJumbo = new THREE.Mesh(new THREE.BoxGeometry(14.5, 5.2, 0.8), jumboMat);
-  nwJumbo.position.set(-66, 24.5, -52.5);
-  nwJumbo.rotation.y = 0.58;
-  const neJumbo = new THREE.Mesh(new THREE.BoxGeometry(14.5, 5.2, 0.8), jumboMat);
-  neJumbo.position.set(66, 24.5, -52.5);
-  neJumbo.rotation.y = -0.58;
-  stadiumGroup.add(northJumbo, eastJumbo, westJumbo, nwJumbo, neJumbo);
+  const westJumbo = new THREE.Mesh(new THREE.BoxGeometry(1.2, 8.2, 24), jumboMat);
+  westJumbo.position.set(-HX - 41.5, 37.5, 0);
+  westSector.add(westJumbo);
 
-  // Monumental Stadium Roof Overhangs + Architectural Cantilever Steel Trusses & LED Fascia Ring (37m high)
-  const nRoof = new THREE.Mesh(new THREE.BoxGeometry(196, 1.1, 24), roofMat);
-  nRoof.position.set(0, 37.2, -66);
+  // Monumental Perimeter Roof Overhangs (41.2m elevation)
+  const nRoof = new THREE.Mesh(new THREE.BoxGeometry(246, 1.2, 28), roofMat);
+  nRoof.position.set(0, 41.2, -HZ - 35.5);
   nRoof.rotation.x = 0.08;
-  const sRoof = new THREE.Mesh(new THREE.BoxGeometry(196, 1.1, 22), roofMat);
-  sRoof.position.set(0, 37.2, 72);
+  northSector.add(nRoof);
+
+  const sRoof = new THREE.Mesh(new THREE.BoxGeometry(246, 1.2, 26), roofMat);
+  sRoof.position.set(0, 41.2, HZ + 39.5);
   sRoof.rotation.x = -0.08;
-  const wRoof = new THREE.Mesh(new THREE.BoxGeometry(24, 1.1, 152), roofMat);
-  wRoof.position.set(-84, 37.2, 0);
+  southSector.add(sRoof);
+
+  const wRoof = new THREE.Mesh(new THREE.BoxGeometry(28, 1.2, 192), roofMat);
+  wRoof.position.set(-HX - 35.5, 41.2, 0);
   wRoof.rotation.z = -0.08;
-  const eRoof = new THREE.Mesh(new THREE.BoxGeometry(24, 1.1, 152), roofMat);
-  eRoof.position.set(84, 37.2, 0);
+  westSector.add(wRoof);
+
+  const eRoof = new THREE.Mesh(new THREE.BoxGeometry(28, 1.2, 192), roofMat);
+  eRoof.position.set(HX + 35.5, 41.2, 0);
   eRoof.rotation.z = 0.08;
-  stadiumGroup.add(nRoof, sRoof, wRoof, eRoof);
+  eastSector.add(eRoof);
 
   const trussMat = new THREE.MeshStandardMaterial({
     color: 0xe2e8f0,
@@ -1419,60 +1461,128 @@ function create3DStadiumAndCrowd(
   const ledFasciaMat = new THREE.MeshBasicMaterial({
     color: stadiumThemeId === 'stadium_neon_arena' ? 0x38bdf8 : 0xfef08a,
   });
-  const frontBeam = new THREE.Mesh(new THREE.BoxGeometry(188, 0.65, 0.65), trussMat);
-  frontBeam.position.set(0, 36.2, -54.2);
-  const ledRibbon = new THREE.Mesh(new THREE.BoxGeometry(186, 0.32, 0.3), ledFasciaMat);
-  ledRibbon.position.set(0, 35.8, -53.9);
-  stadiumGroup.add(frontBeam, ledRibbon);
+  const frontBeam = new THREE.Mesh(new THREE.BoxGeometry(236, 0.75, 0.75), trussMat);
+  frontBeam.position.set(0, 40.0, -HZ - 21.8);
+  const ledRibbon = new THREE.Mesh(new THREE.BoxGeometry(234, 0.36, 0.34), ledFasciaMat);
+  ledRibbon.position.set(0, 39.5, -HZ - 21.4);
+  northSector.add(frontBeam, ledRibbon);
 
-  for (let tx = -80; tx <= 80; tx += 16) {
-    const strut = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.8, 23.5), trussMat);
-    strut.position.set(tx, 37.9, -66);
-    strut.rotation.x = 0.08;
-    stadiumGroup.add(strut);
-  }
-
-  // 4 Monumental Corner Floodlight Towers (48m tall with multi-panel LED matrices)
-  const towerGeo = new THREE.CylinderGeometry(0.65, 1.1, 48, 8);
+  // 4. 6 MONUMENTAL FLOODLIGHT TOWERS WITH 3-LEVEL LOD (LOD0, LOD1, LOD2 by distance)
   const towerMat = new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.6, roughness: 0.4 });
-  const lampHeadGeo = new THREE.BoxGeometry(8.2, 4.2, 1.4);
   const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0xfef9c3 });
 
-  const towerCoords = [
-    [-86, -64],
-    [86, -64],
-    [-86, 64],
-    [86, 64],
+  // Shared LOD geometries for the 6 Floodlight Towers (58m tall)
+  const towerMastLod0 = new THREE.CylinderGeometry(0.75, 1.35, 58, 12);
+  const towerRingLod0 = new THREE.CylinderGeometry(1.65, 1.65, 1.2, 10);
+  const lampHeadLod0 = new THREE.BoxGeometry(10.4, 5.2, 1.6);
+  const lampVisorLod0 = new THREE.BoxGeometry(10.8, 0.45, 2.2);
+
+  const towerMastLod1 = new THREE.CylinderGeometry(0.8, 1.35, 58, 6);
+  const lampHeadLod1 = new THREE.BoxGeometry(10.2, 5.0, 1.4);
+
+  const towerMastLod2 = new THREE.BoxGeometry(1.4, 58, 1.4);
+  const lampHeadLod2 = new THREE.BoxGeometry(9.8, 4.8, 1.0);
+
+  // 6 Towers: 4 Corners + 2 Midfield North/South Towers
+  const towerCoords: [number, number, THREE.Group][] = [
+    [-112, -82, northSector],
+    [0, -90, northSector],
+    [112, -82, northSector],
+    [-112, 84, southSector],
+    [0, 92, southSector],
+    [112, 84, southSector],
   ];
-  for (const [tx, tz] of towerCoords) {
-    const tower = new THREE.Mesh(towerGeo, towerMat);
-    tower.position.set(tx, 24, tz);
-    const head = new THREE.Mesh(lampHeadGeo, lampHeadMat);
-    head.position.set(tx, 48, tz);
-    head.lookAt(0, 0, 0);
-    stadiumGroup.add(tower, head);
+  const towerLodObjects: THREE.LOD[] = [];
+
+  for (const [tx, tz, sectorGrp] of towerCoords) {
+    const lod = new THREE.LOD();
+    lod.position.set(tx, 0, tz);
+
+    // LOD 0 (0 - 155m): Detailed steel column + structural support rings + multi-panel LED head & visor
+    const g0 = new THREE.Group();
+    const mast0 = new THREE.Mesh(towerMastLod0, towerMat);
+    mast0.position.y = 29;
+    const ringA = new THREE.Mesh(towerRingLod0, trussMat);
+    ringA.position.y = 22;
+    const ringB = new THREE.Mesh(towerRingLod0, trussMat);
+    ringB.position.y = 42;
+    const head0 = new THREE.Mesh(lampHeadLod0, lampHeadMat);
+    head0.position.y = 58;
+    head0.lookAt(0 - tx, 0, 0 - tz);
+    const visor0 = new THREE.Mesh(lampVisorLod0, trussMat);
+    visor0.position.y = 60.7;
+    visor0.lookAt(0 - tx, 0, 0 - tz);
+    g0.add(mast0, ringA, ringB, head0, visor0);
+
+    // LOD 1 (155 - 260m): Medium detail
+    const g1 = new THREE.Group();
+    const mast1 = new THREE.Mesh(towerMastLod1, towerMat);
+    mast1.position.y = 29;
+    const head1 = new THREE.Mesh(lampHeadLod1, lampHeadMat);
+    head1.position.y = 58;
+    head1.lookAt(0 - tx, 0, 0 - tz);
+    g1.add(mast1, head1);
+
+    // LOD 2 (> 260m): Ultra-low-poly silhouette
+    const g2 = new THREE.Group();
+    const mast2 = new THREE.Mesh(towerMastLod2, towerMat);
+    mast2.position.y = 29;
+    const head2 = new THREE.Mesh(lampHeadLod2, lampHeadMat);
+    head2.position.y = 58;
+    g2.add(mast2, head2);
+
+    lod.addLevel(g0, 0);
+    lod.addLevel(g1, 155);
+    lod.addLevel(g2, 260);
+    sectorGrp.add(lod);
+    towerLodObjects.push(lod);
   }
 
-  // 4. Shoulder-to-Shoulder 2D Grid of 3D Instanced Spectators across Tiers 1, 2 & 3 (Single WebGL Draw Call)
-  const candidateSeats: { x: number; y: number; z: number }[] = [];
-  const colStep = isSoftwareGl || quality === 'baja' ? 1.65 : quality === 'media' ? 1.32 : 1.08;
+  // 5. EXTERIOR CITY SKYLINE & ESPLANADE (Visible from high/panoramic views, 1 single merged draw call!)
+  const cityBoxes: { w: number; h: number; d: number; x: number; y: number; z: number }[] = [
+    // Outer Stadium Esplanade Plinths
+    { w: 340, h: 0.6, d: 60, x: 0, y: -0.28, z: -135 },
+    { w: 340, h: 0.6, d: 60, x: 0, y: -0.28, z: 138 },
+    { w: 60, h: 0.6, d: 220, x: -155, y: -0.28, z: 0 },
+    { w: 60, h: 0.6, d: 220, x: 155, y: -0.28, z: 0 },
+  ];
+  const cityRingCount = 32;
+  for (let i = 0; i < cityRingCount; i++) {
+    const angle = (i / cityRingCount) * Math.PI * 2;
+    const radX = 215 + ((i * 37) % 55);
+    const radZ = 175 + ((i * 29) % 50);
+    const bx = Math.cos(angle) * radX;
+    const bz = Math.sin(angle) * radZ;
+    const bw = 18 + ((i * 13) % 18);
+    const bd = 18 + ((i * 17) % 18);
+    const bh = 22 + ((i * 41) % 54);
+    cityBoxes.push({ w: bw, h: bh, d: bd, x: bx, y: bh / 2, z: bz });
+  }
+  const cityMat = getSharedLambertMaterial(0x1e293b);
+  const cityMesh = new THREE.Mesh(mergeBoxBoxesToSingleGeometry(cityBoxes), cityMat);
+  citySector.add(cityMesh);
 
-  // Tier 1 North, East, West
+  // 6. GPU-INSTANCED CROWD WITH VERTEX-SHADER ANIMATION + DISTANT BILLBOARDS (80,000 Virtual Capacity)
+  const nearSeats: { x: number; y: number; z: number }[] = [];
+  const billboardSeats: { x: number; y: number; z: number }[] = [];
+  const colStep = isSoftwareGl || quality === 'baja' ? 2.1 : quality === 'media' ? 1.65 : 1.32;
+
+  // Tier 1 & Tier 2 -> Near 3D GPU-Instanced Spectators
   for (let row = 0; row < stepsTier1; row++) {
-    const y = 1.16 + row * 1.18;
-    const zBase = -37.1 - row * 1.48;
-    for (let x = -54; x <= 54; x += colStep) {
+    const y = 1.22 + row * 1.24;
+    const zBase = -HZ - 3.7 - row * 1.55;
+    for (let x = -72; x <= 72; x += colStep) {
       if (
         row < 5 &&
-        (Math.abs(x) < 2.6 ||
-          Math.abs(x - -34) < 1.1 ||
-          Math.abs(x - -8) < 1.1 ||
-          Math.abs(x - 18) < 1.1 ||
-          Math.abs(x - 42) < 1.1)
+        (Math.abs(x) < 3.4 ||
+          Math.abs(x - -44) < 1.3 ||
+          Math.abs(x - -12) < 1.3 ||
+          Math.abs(x - 20) < 1.3 ||
+          Math.abs(x - 52) < 1.3)
       ) {
         continue;
       }
-      candidateSeats.push({
+      nearSeats.push({
         x: x + ((row * 17) % 5) * 0.08,
         y,
         z: zBase + ((row * 13) % 3) * 0.08,
@@ -1480,60 +1590,130 @@ function create3DStadiumAndCrowd(
     }
   }
   for (let row = 0; row < stepsTier1; row++) {
-    const y = 1.16 + row * 1.18;
-    const xBase = 56.5 + row * 1.48;
-    for (let z = -35; z <= 35; z += colStep) {
-      candidateSeats.push({
-        x: xBase + ((row * 11) % 3) * 0.08,
-        y,
-        z: z + ((row * 19) % 5) * 0.08,
-      });
-      candidateSeats.push({
-        x: -xBase - ((row * 11) % 3) * 0.08,
-        y,
-        z: z + ((row * 19) % 5) * 0.08,
-      });
+    const y = 1.22 + row * 1.24;
+    const xBase = HX + 4.7 + row * 1.55;
+    for (let z = -46; z <= 46; z += colStep) {
+      nearSeats.push({ x: xBase, y, z });
+      nearSeats.push({ x: -xBase, y, z });
     }
   }
-
-  // Tier 2 (Bandeja Media) & Tier 3 (Bandeja Alta) Spectators
-  const upperColStep = colStep * 1.55;
+  const upperColStep = colStep * 1.45;
   for (let row = 0; row < stepsTier2; row += 2) {
-    const y = 13.8 + row * 1.42;
-    const dist = 12.5 + row * 1.65;
-    for (let x = -64; x <= 64; x += upperColStep) {
-      candidateSeats.push({ x, y, z: -37.1 - dist });
+    const y = 14.4 + row * 1.5;
+    const dist = 13.5 + row * 1.72;
+    for (let x = -84; x <= 84; x += upperColStep) {
+      nearSeats.push({ x, y, z: -HZ - 3.7 - dist });
     }
-    for (let z = -44; z <= 44; z += upperColStep) {
-      candidateSeats.push({ x: 56.5 + dist, y, z });
-      candidateSeats.push({ x: -56.5 - dist, y, z });
-    }
-  }
-  for (let row = 0; row < stepsTier3; row += 2) {
-    const y = 24.5 + row * 1.65;
-    const dist = 23.2 + row * 1.85;
-    for (let x = -74; x <= 74; x += upperColStep * 1.25) {
-      candidateSeats.push({ x, y, z: -37.1 - dist });
-    }
-    for (let z = -52; z <= 52; z += upperColStep * 1.25) {
-      candidateSeats.push({ x: 56.5 + dist, y, z });
-      candidateSeats.push({ x: -56.5 - dist, y, z });
+    for (let z = -58; z <= 58; z += upperColStep) {
+      nearSeats.push({ x: HX + 4.7 + dist, y, z });
+      nearSeats.push({ x: -HX - 4.7 - dist, y, z });
     }
   }
 
-  const crowdCount = candidateSeats.length;
+  // Tier 3 (Bandeja Alta Monumental & South Upper) -> Distant GPU Billboard Spectators (2 triangles per spectator)
+  const bbStep = upperColStep * 1.15;
+  for (let row = 0; row < stepsTier3; row += 2) {
+    const y = 25.9 + row * 1.75;
+    const dist = 25.0 + row * 1.95;
+    for (let x = -98; x <= 98; x += bbStep) {
+      billboardSeats.push({ x, y, z: -HZ - 3.7 - dist });
+      billboardSeats.push({ x, y, z: HZ + 5.2 + dist });
+    }
+    for (let z = -70; z <= 70; z += bbStep) {
+      billboardSeats.push({ x: HX + 4.7 + dist, y, z });
+      billboardSeats.push({ x: -HX - 4.7 - dist, y, z });
+    }
+  }
+
+  const crowdShaderCtrl: CrowdGpuShaderController = {
+    uTime: { value: 0 },
+    uWaveAmp: { value: 0.14 },
+    uWaveSpeed: { value: 4.5 },
+  };
+
+  const attachCrowdVertexAnimation = (mat: THREE.MeshLambertMaterial) => {
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uCrowdTime = crowdShaderCtrl.uTime;
+      shader.uniforms.uCrowdWaveAmp = crowdShaderCtrl.uWaveAmp;
+      shader.uniforms.uCrowdWaveSpeed = crowdShaderCtrl.uWaveSpeed;
+      shader.vertexShader =
+        `
+        attribute float aInstancePhase;
+        uniform float uCrowdTime;
+        uniform float uCrowdWaveAmp;
+        uniform float uCrowdWaveSpeed;
+        ` +
+        shader.vertexShader.replace(
+          '#include <begin_vertex>',
+          `
+          #include <begin_vertex>
+          float jumpWave = max(0.0, sin(uCrowdTime * uCrowdWaveSpeed + aInstancePhase));
+          transformed.y += jumpWave * uCrowdWaveAmp;
+          `
+        );
+    };
+  };
+
+  // Near 3D Spectators InstancedMesh
+  const nearCrowdCount = nearSeats.length;
   const specGeo = createSpectatorGeometry();
+  const nearPhaseArr = new Float32Array(nearCrowdCount);
+  for (let i = 0; i < nearCrowdCount; i++) {
+    nearPhaseArr[i] = ((i * 37) % 100) * 0.0628;
+  }
+  specGeo.setAttribute('aInstancePhase', new THREE.InstancedBufferAttribute(nearPhaseArr, 1));
+
   const specMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
-  const crowdMesh = new THREE.InstancedMesh(specGeo, specMat, crowdCount);
-  crowdMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  attachCrowdVertexAnimation(specMat);
+  const crowdMesh = new THREE.InstancedMesh(specGeo, specMat, nearCrowdCount);
   crowdMesh.frustumCulled = false;
 
-  // Waving 3D Team Flags & Scarves across all tiers
-  const flagCount = isSoftwareGl ? 36 : 72;
-  const flagBannerGeo = new THREE.BoxGeometry(1.55, 0.92, 0.08);
+  // Distant Tier-3 Billboard Spectators InstancedMesh
+  const billboardCrowdCount = billboardSeats.length;
+  const bbGeo = new THREE.PlaneGeometry(0.68, 0.98);
+  bbGeo.translate(0, 0.49, 0);
+  const bbPhaseArr = new Float32Array(billboardCrowdCount);
+  for (let i = 0; i < billboardCrowdCount; i++) {
+    bbPhaseArr[i] = ((i * 53) % 100) * 0.0628;
+  }
+  bbGeo.setAttribute('aInstancePhase', new THREE.InstancedBufferAttribute(bbPhaseArr, 1));
+  const bbMat = new THREE.MeshLambertMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+  attachCrowdVertexAnimation(bbMat);
+  const crowdBillboardMesh = new THREE.InstancedMesh(bbGeo, bbMat, billboardCrowdCount);
+  crowdBillboardMesh.frustumCulled = false;
+
+  // Waving 3D Team Flags & Scarves with GPU Vertex-Shader Wave
+  const flagCount = isSoftwareGl ? 42 : 84;
+  const flagBannerGeo = new THREE.BoxGeometry(1.65, 0.96, 0.08, 4, 1, 1);
+  const flagPhaseArr = new Float32Array(flagCount);
+  for (let i = 0; i < flagCount; i++) {
+    flagPhaseArr[i] = i * 0.85;
+  }
+  flagBannerGeo.setAttribute('aInstancePhase', new THREE.InstancedBufferAttribute(flagPhaseArr, 1));
+
   const flagBannerMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  flagBannerMat.onBeforeCompile = (shader) => {
+    shader.uniforms.uCrowdTime = crowdShaderCtrl.uTime;
+    shader.uniforms.uCrowdWaveAmp = crowdShaderCtrl.uWaveAmp;
+    shader.uniforms.uCrowdWaveSpeed = crowdShaderCtrl.uWaveSpeed;
+    shader.vertexShader =
+      `
+      attribute float aInstancePhase;
+      uniform float uCrowdTime;
+      uniform float uCrowdWaveAmp;
+      uniform float uCrowdWaveSpeed;
+      ` +
+      shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `
+        #include <begin_vertex>
+        float clothWave = sin(uCrowdTime * (uCrowdWaveSpeed * 1.45) + aInstancePhase + position.x * 2.6);
+        transformed.z += clothWave * (0.18 + uCrowdWaveAmp * 0.45);
+        transformed.y += max(0.0, sin(uCrowdTime * uCrowdWaveSpeed + aInstancePhase)) * uCrowdWaveAmp;
+        `
+      );
+  };
   const flagsMesh = new THREE.InstancedMesh(flagBannerGeo, flagBannerMat, flagCount);
-  flagsMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   flagsMesh.frustumCulled = false;
 
   const dummy = new THREE.Object3D();
@@ -1551,9 +1731,9 @@ function create3DStadiumAndCrowd(
   const crowdBasePositions: { x: number; y: number; z: number; phase: number }[] = [];
   const flagBasePositions: { x: number; y: number; z: number; phase: number }[] = [];
 
-  for (let i = 0; i < crowdCount; i++) {
-    const seat = candidateSeats[i];
-    const phase = ((i * 37) % 100) * 0.0628;
+  for (let i = 0; i < nearCrowdCount; i++) {
+    const seat = nearSeats[i];
+    const phase = nearPhaseArr[i];
     crowdBasePositions.push({ x: seat.x, y: seat.y, z: seat.z, phase });
 
     dummy.position.set(seat.x, seat.y, seat.z);
@@ -1563,12 +1743,21 @@ function create3DStadiumAndCrowd(
     crowdMesh.setColorAt(i, colorPalette[(i * 7 + Math.floor(seat.y * 3)) % colorPalette.length]);
   }
 
+  for (let i = 0; i < billboardCrowdCount; i++) {
+    const seat = billboardSeats[i];
+    dummy.position.set(seat.x, seat.y, seat.z);
+    dummy.lookAt(0, 1.5, 0);
+    dummy.updateMatrix();
+    crowdBillboardMesh.setMatrixAt(i, dummy.matrix);
+    crowdBillboardMesh.setColorAt(i, colorPalette[(i * 11 + Math.floor(seat.y * 2)) % colorPalette.length]);
+  }
+
   for (let f = 0; f < flagCount; f++) {
-    const baseSpec = crowdBasePositions[(f * 31) % crowdBasePositions.length];
+    const baseSpec = crowdBasePositions[(f * 29) % crowdBasePositions.length];
     const fx = baseSpec.x;
-    const fy = baseSpec.y + 1.15;
+    const fy = baseSpec.y + 1.18;
     const fz = baseSpec.z;
-    const phase = f * 0.9;
+    const phase = flagPhaseArr[f];
     flagBasePositions.push({ x: fx, y: fy, z: fz, phase });
 
     dummy.position.set(fx, fy, fz);
@@ -1583,11 +1772,13 @@ function create3DStadiumAndCrowd(
 
   crowdMesh.instanceMatrix.needsUpdate = true;
   if (crowdMesh.instanceColor) crowdMesh.instanceColor.needsUpdate = true;
+  crowdBillboardMesh.instanceMatrix.needsUpdate = true;
+  if (crowdBillboardMesh.instanceColor) crowdBillboardMesh.instanceColor.needsUpdate = true;
   flagsMesh.instanceMatrix.needsUpdate = true;
   if (flagsMesh.instanceColor) flagsMesh.instanceColor.needsUpdate = true;
-  stadiumGroup.add(crowdMesh, flagsMesh);
+  stadiumGroup.add(crowdMesh, crowdBillboardMesh, flagsMesh);
 
-  // 5. Camera Flashes in the Stands (Destellos de flashes fotográficos en goles y jugadas clave)
+  // 7. Camera Flashes in the Stands
   const flashCount = isSoftwareGl ? 60 : 140;
   const flashPositions = new Float32Array(flashCount * 3);
   for (let i = 0; i < flashCount; i++) {
@@ -1621,10 +1812,10 @@ function create3DStadiumAndCrowd(
   const flareCoreMat = new THREE.MeshBasicMaterial({ color: 0xfef08a });
 
   const flareCoords = [
-    [-40, 3.8, -40.5],
-    [40, 3.8, -40.5],
-    [-58.5, 4.0, -14],
-    [58.5, 4.0, 14],
+    [-52, 4.0, -HZ - 7.5],
+    [52, 4.0, -HZ - 7.5],
+    [-HX - 6.5, 4.2, -16],
+    [HX + 6.5, 4.2, 16],
   ];
   for (const [fx, fy, fz] of flareCoords) {
     const smoke = new THREE.Mesh(flareSmokeGeo, flareSmokeMat);
@@ -1635,18 +1826,33 @@ function create3DStadiumAndCrowd(
   }
   stadiumGroup.add(flaresGroup);
 
-  // Freeze all static stadium meshes so Three.js skips 240+ matrix multiplications per frame
+  // Freeze all static stadium meshes so Three.js skips matrix multiplications per frame
   freezeStaticHierarchy(stadiumGroup);
+
+  const cullableSectors: CullableStadiumSector[] = [
+    { name: 'NorthStand', group: northSector, bounds: new THREE.Sphere(new THREE.Vector3(0, 22, -78), 145) },
+    { name: 'SouthStand', group: southSector, bounds: new THREE.Sphere(new THREE.Vector3(0, 22, 82), 145) },
+    { name: 'EastStand', group: eastSector, bounds: new THREE.Sphere(new THREE.Vector3(102, 22, 0), 115) },
+    { name: 'WestStand', group: westSector, bounds: new THREE.Sphere(new THREE.Vector3(-102, 22, 0), 115) },
+    { name: 'ExteriorCity', group: citySector, bounds: new THREE.Sphere(new THREE.Vector3(0, 25, 0), 360) },
+  ];
 
   return {
     stadiumGroup,
     crowdMesh,
+    crowdBillboardMesh,
     flagsMesh,
     flaresGroup,
     cameraFlashes,
     updateJumbotron,
     crowdBasePositions,
     flagBasePositions,
+    cullableSectors,
+    towerLodObjects,
+    lampHeadMat,
+    crowdShaderCtrl,
+    nearCrowdCount,
+    billboardCrowdCount,
   };
 }
 
@@ -1822,13 +2028,13 @@ function createPlayerRig3D(
     color: 0xef4444,
   });
   const overheadCursor = new THREE.Mesh(SHARED_PLAYER_GEOS.cursorGeo, cursorMat);
-  overheadCursor.position.set(0, 3.05, 0);
+  overheadCursor.position.set(0, 2.35, 0);
   overheadCursor.visible = false;
   root.add(overheadCursor);
 
-  // 2. Anatomical Body Group with Broadcast Athlete Visual Scale (1.36x) & Visible Height Scale
+  // 2. Anatomical Body Group with Realistic Proportioned Scale (0.95x) so the 105x68m pitch feels vast and open
   const bodyGroup = new THREE.Group();
-  const broadcastAthleteScale = 1.36;
+  const broadcastAthleteScale = 0.95;
   const scaleY =
     Math.max(0.86, Math.min(1.16, Math.pow(effectiveHeightCm / 180, 1.35))) * broadcastAthleteScale;
   const scaleXZ =
@@ -2112,12 +2318,14 @@ function createPlayerRig3D(
     overheadCursor,
     directionArrow,
     cardMesh,
+    baseScaleY: scaleY,
+    baseScaleXZ: scaleXZ,
   };
 }
 
 function animateCoachRig(rig: PlayerRig3D, mood: CoachMood, nowMs: number, dt: number, baseX: number): void {
   const paceOffset = mood === 'protest' ? Math.sin(nowMs * 0.004) * 1.4 : Math.sin(nowMs * 0.0015) * 0.6;
-  rig.root.position.set(baseX + paceOffset, 0, -PITCH.HALF_Y - 1.1);
+  rig.root.position.set(baseX + paceOffset, 0, -WORLD_PITCH.HALF_Z - 1.4);
   rig.root.rotation.y = 0; // face the pitch (+Z)
 
   let targetY = 0;
@@ -2157,8 +2365,8 @@ function animateCoachRig(rig: PlayerRig3D, mood: CoachMood, nowMs: number, dt: n
 }
 
 export const STADIUM_PITCH_3D_SIZE = {
-  width: 1050,
-  depth: 600,
+  width: 1200,
+  depth: 800,
 } as const;
 
 export function createMatchScene3D(
@@ -2183,8 +2391,8 @@ export function createMatchScene3D(
   const isSoftwareGl = /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(unmaskedRenderer);
 
   const quality = settings.visual.quality;
-  // Use crisp ground contact shadows by default; only enable heavy directional shadow map pass on Ultra
-  const enableShadows = !isSoftwareGl && settings.visual.shadows && quality === 'ultra';
+  // Single directional light shadow map for players and ball (enabled on Alta/Ultra when hardware GPU is active)
+  const enableShadows = !isSoftwareGl && settings.visual.shadows && (quality === 'alta' || quality === 'ultra');
 
   const renderer = new THREE.WebGLRenderer({
     antialias: !isSoftwareGl && (quality === 'alta' || quality === 'ultra'),
@@ -2193,7 +2401,8 @@ export function createMatchScene3D(
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   const maxDpr =
     isSoftwareGl || quality === 'baja' ? 1.0 : quality === 'media' ? 1.15 : quality === 'alta' ? 1.25 : 1.5;
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxDpr));
+  const baseDevicePixelRatio = Math.min(window.devicePixelRatio || 1, maxDpr);
+  renderer.setPixelRatio(baseDevicePixelRatio);
   renderer.setSize(mountEl.clientWidth || 1280, mountEl.clientHeight || 720);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure =
@@ -2208,74 +2417,74 @@ export function createMatchScene3D(
   renderer.domElement.className = 'block w-full h-full';
   mountEl.appendChild(renderer.domElement);
 
-  // 2. Scene, Sky, Ambient Illumination & Broadcast Stadium Floodlight Environment
+  // 2. Scene, Sky, Baked Lightmap/LightProbe Simulation & Single Dynamic Directional Light
   const scene = new THREE.Scene();
   const isFoggy = settings.match.weather === 'neblina';
+  let activeTimeOfDay: GameSettings['match']['timeOfDay'] = settings.match.timeOfDay;
   const skyColor = isFoggy
     ? 0x334155
-    : settings.match.timeOfDay === 'dia'
+    : activeTimeOfDay === 'dia'
     ? 0x1a2636
-    : settings.match.timeOfDay === 'atardecer'
+    : activeTimeOfDay === 'atardecer'
     ? 0x2a1810
     : 0x090e17;
   scene.background = new THREE.Color(skyColor);
-  scene.fog = new THREE.FogExp2(skyColor, isFoggy ? 0.0058 : 0.0014);
+  const sceneFog = new THREE.FogExp2(skyColor, isFoggy ? 0.0052 : 0.0011);
+  scene.fog = sceneFog;
 
-  if (!isSoftwareGl && quality === 'ultra') {
+  if (!isSoftwareGl && (quality === 'alta' || quality === 'ultra')) {
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
   }
 
+  // Baked GI / Light Probe Spherical Harmonics approximation + Single Dynamic Directional Light
   const ambientLight = new THREE.AmbientLight(
     0xffffff,
-    settings.match.timeOfDay === 'noche' ? 0.62 : 0.74
+    activeTimeOfDay === 'noche' ? 0.62 : 0.74
   );
   scene.add(ambientLight);
 
   const hemiLight = new THREE.HemisphereLight(
-    settings.match.timeOfDay === 'atardecer' ? 0xfed7aa : 0xf0f9ff,
+    activeTimeOfDay === 'atardecer' ? 0xfed7aa : 0xf0f9ff,
     0x14532d,
-    settings.match.timeOfDay === 'noche' ? 0.72 : 0.85
+    activeTimeOfDay === 'noche' ? 0.72 : 0.85
   );
-  hemiLight.position.set(0, 50, 0);
+  hemiLight.position.set(0, 60, 0);
   scene.add(hemiLight);
 
   const mainLight = new THREE.DirectionalLight(
-    settings.match.timeOfDay === 'atardecer' ? 0xfdba74 : 0xfffbeb,
-    settings.match.timeOfDay === 'noche' ? 1.95 : 2.15
+    activeTimeOfDay === 'atardecer' ? 0xfdba74 : 0xfffbeb,
+    activeTimeOfDay === 'noche' ? 1.95 : 2.15
   );
-  mainLight.position.set(24, 48, 34);
+  mainLight.position.set(32, 62, 42);
   if (enableShadows) {
     mainLight.castShadow = true;
-    mainLight.shadow.mapSize.width = 1024;
-    mainLight.shadow.mapSize.height = 1024;
+    const shadowRes = quality === 'ultra' ? 1024 : 512;
+    mainLight.shadow.mapSize.width = shadowRes;
+    mainLight.shadow.mapSize.height = shadowRes;
     mainLight.shadow.camera.near = 10;
-    mainLight.shadow.camera.far = 160;
-    mainLight.shadow.camera.left = -64;
-    mainLight.shadow.camera.right = 64;
-    mainLight.shadow.camera.top = 46;
-    mainLight.shadow.camera.bottom = -46;
+    mainLight.shadow.camera.far = 190;
+    mainLight.shadow.camera.left = -76;
+    mainLight.shadow.camera.right = 76;
+    mainLight.shadow.camera.top = 52;
+    mainLight.shadow.camera.bottom = -52;
     mainLight.shadow.bias = -0.0005;
   }
   scene.add(mainLight);
 
-  const fillLight = new THREE.DirectionalLight(0xe0f2fe, 0.85);
-  fillLight.position.set(-35, 36, -28);
-  scene.add(fillLight);
-
-  // 3. Telephoto Broadcast TV Camera Setup (37 deg FOV, far=900 so monumental stadium never clips)
+  // 3. Wide Broadcast TV Camera Setup (41 deg FOV, far=1000 so 140x90m pitch & 80k stadium + exterior city never clip)
   const camera = new THREE.PerspectiveCamera(
-    37,
+    41,
     (mountEl.clientWidth || 1280) / (mountEl.clientHeight || 720),
     0.5,
-    900
+    1000
   );
-  camera.position.set(0, 15.2, 35.5);
-  camera.lookAt(0, 0.9, -4.5);
+  camera.position.set(0, 21.8, 48.2);
+  camera.lookAt(0, 0.85, -5.5);
 
-  // 4. 3D Pitch (1050x600 3D Ground Plane + Natural Broadcast Turf)
-  const apronGeo = new THREE.PlaneGeometry(STADIUM_PITCH_3D_SIZE.width, STADIUM_PITCH_3D_SIZE.depth);
+  // 4. SINGLE-PLANE 140 x 90 m PITCH WITH CUSTOM GLSL MOWING & VARIATION SHADER (Optimization #1)
+  const apronGeo = new THREE.PlaneGeometry(STADIUM_PITCH_3D_SIZE.width, STADIUM_PITCH_3D_SIZE.depth, 1, 1);
   apronGeo.rotateX(-Math.PI / 2);
   const apronMat = getSharedLambertMaterial(0x1e4619);
   const apronMesh = new THREE.Mesh(apronGeo, apronMat);
@@ -2289,7 +2498,8 @@ export function createMatchScene3D(
     isSoftwareGl,
     maxAniso
   );
-  const pitchGeo = new THREE.PlaneGeometry(PITCH.LENGTH + 6.5, PITCH.WIDTH + 5.5);
+  // Single quad plane (1x1 segments = 2 triangles, 1 draw call, zero modeled grass blades)
+  const pitchGeo = new THREE.PlaneGeometry(WORLD_PITCH.LENGTH + 8.5, WORLD_PITCH.WIDTH + 7.5, 1, 1);
   pitchGeo.rotateX(-Math.PI / 2);
   const pitchMat = new THREE.MeshStandardMaterial({
     map: turfMap,
@@ -2303,6 +2513,34 @@ export function createMatchScene3D(
         : 0.84,
     metalness: settings.match.weather === 'lluvia' || settings.match.weather === 'tormenta' ? 0.04 : 0.01,
   });
+
+  // Custom GLSL Mowing Stripes & Organic Macro/Micro Turf Variation Shader on the Single Plane
+  pitchMat.onBeforeCompile = (shader) => {
+    shader.vertexShader =
+      `varying vec3 vPitchWorldPos;\n` +
+      shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `
+        #include <begin_vertex>
+        vPitchWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+        `
+      );
+    shader.fragmentShader =
+      `varying vec3 vPitchWorldPos;\n` +
+      shader.fragmentShader.replace(
+        '#include <color_fragment>',
+        `
+        #include <color_fragment>
+        float stripeX = smoothstep(-0.15, 0.15, sin(vPitchWorldPos.x * 0.4039));
+        float stripeZ = smoothstep(-0.2, 0.2, cos(vPitchWorldPos.z * 0.349));
+        float macroNoise = sin(vPitchWorldPos.x * 0.09 + vPitchWorldPos.z * 0.11) * 0.5 + 0.5;
+        vec3 freshBladeTint = vec3(1.045, 1.06, 0.98);
+        vec3 deepCutTint = vec3(0.935, 0.96, 0.94);
+        diffuseColor.rgb *= mix(deepCutTint, freshBladeTint, stripeX * 0.72 + stripeZ * 0.16 + macroNoise * 0.12);
+        `
+      );
+  };
+
   const pitchMesh = new THREE.Mesh(pitchGeo, pitchMat);
   pitchMesh.receiveShadow = enableShadows;
   freezeStaticMesh(pitchMesh);
@@ -2312,21 +2550,23 @@ export function createMatchScene3D(
   freezeStaticHierarchy(markingsGroup);
   scene.add(markingsGroup);
 
-  // 5. 3D Goals & Nets
+  // 5. 3D Goals & Nets (at ±70m on the 140x90m pitch)
   const leftGoal = create3DGoal('left');
   const rightGoal = create3DGoal('right');
   scene.add(leftGoal.group, rightGoal.group);
 
-  // 6. Monumental 3-Tier 3D Stadium, Dense Crowd, Waving Flags, Camera Flashes & Flares
+  // 6. Monumental 80,000-Seat 3-Tier Stadium, 6 LOD Light Towers, GPU Vertex-Shader Crowd & Exterior City
   const {
     stadiumGroup,
-    crowdMesh,
-    flagsMesh,
     flaresGroup,
     cameraFlashes,
     updateJumbotron,
-    crowdBasePositions,
-    flagBasePositions,
+    cullableSectors,
+    towerLodObjects,
+    lampHeadMat,
+    crowdShaderCtrl,
+    nearCrowdCount,
+    billboardCrowdCount,
   } = create3DStadiumAndCrowd(
     homeTeam,
     awayTeam,
@@ -2336,11 +2576,48 @@ export function createMatchScene3D(
   );
   scene.add(stadiumGroup);
 
+  // Real-time Day / Afternoon / Night Lighting & Lightmap/Probe Switcher (No new scene reload required)
+  const setTimeOfDay = (nextTime: GameSettings['match']['timeOfDay']) => {
+    activeTimeOfDay = nextTime;
+    const nextSky = isFoggy
+      ? 0x334155
+      : nextTime === 'dia'
+      ? 0x1a2636
+      : nextTime === 'atardecer'
+      ? 0x2a1810
+      : 0x090e17;
+    (scene.background as THREE.Color).setHex(nextSky);
+    sceneFog.color.setHex(nextSky);
+
+    ambientLight.intensity = nextTime === 'noche' ? 0.62 : nextTime === 'atardecer' ? 0.68 : 0.76;
+    hemiLight.color.setHex(nextTime === 'atardecer' ? 0xfed7aa : nextTime === 'noche' ? 0xbae6fd : 0xf0f9ff);
+    hemiLight.groundColor.setHex(nextTime === 'atardecer' ? 0x1e3a1e : 0x14532d);
+    hemiLight.intensity = nextTime === 'noche' ? 0.72 : 0.86;
+
+    mainLight.color.setHex(nextTime === 'atardecer' ? 0xfdba74 : nextTime === 'noche' ? 0xf8fafc : 0xfffbeb);
+    mainLight.intensity = nextTime === 'noche' ? 1.95 : nextTime === 'atardecer' ? 2.05 : 2.18;
+    if (nextTime === 'atardecer') {
+      mainLight.position.set(52, 34, 46);
+    } else if (nextTime === 'noche') {
+      mainLight.position.set(28, 64, 38);
+    } else {
+      mainLight.position.set(32, 62, 42);
+    }
+
+    // Toggle 6 Floodlight Tower LED matrix glow intensity
+    lampHeadMat.color.setHex(
+      nextTime === 'noche' ? 0xffffff : nextTime === 'atardecer' ? 0xfef08a : 0xcbd5e1
+    );
+    renderer.toneMappingExposure =
+      nextTime === 'dia' ? 1.08 : nextTime === 'atardecer' ? 1.04 : 1.06;
+  };
+  setTimeOfDay(activeTimeOfDay);
+
   // 7. 3D Soccer Ball + Ground Shadow
   const shadowTex = createRadialShadowTexture();
   const ballTex = createSoccerBallTexture(equippedOptions?.ballId ?? 'ball_pro_atlas');
   const ballMesh = new THREE.Mesh(
-    new THREE.SphereGeometry(0.28, 22, 22),
+    new THREE.SphereGeometry(0.22, 22, 22),
     new THREE.MeshStandardMaterial({
       map: ballTex,
       roughness: 0.32,
@@ -2350,7 +2627,7 @@ export function createMatchScene3D(
   ballMesh.castShadow = enableShadows;
   scene.add(ballMesh);
 
-  const ballShadowGeo = new THREE.PlaneGeometry(0.82, 0.82);
+  const ballShadowGeo = new THREE.PlaneGeometry(0.68, 0.68);
   ballShadowGeo.rotateX(-Math.PI / 2);
   const ballShadowMat = new THREE.MeshBasicMaterial({
     map: shadowTex,
@@ -2375,7 +2652,7 @@ export function createMatchScene3D(
   const colorDust = new THREE.Color('#A16207');
   const colorSpark = new THREE.Color('#FEF08A');
 
-  // 9. 3D Free Kick Trajectory Preview Arc
+  // 9. 3D Free Kick & Goal Kick Trajectory Preview Arc + Grass Trajectory Arrow
   const arcPointsCount = 24;
   const arcPositions = new Float32Array(arcPointsCount * 3);
   const arcGeo = new THREE.BufferGeometry();
@@ -2384,6 +2661,39 @@ export function createMatchScene3D(
   const freeKickArcLine = new THREE.Line(arcGeo, arcMat);
   freeKickArcLine.visible = false;
   scene.add(freeKickArcLine);
+
+  const gkGroundPositions = new Float32Array(arcPointsCount * 3);
+  const gkGroundGeo = new THREE.BufferGeometry();
+  gkGroundGeo.setAttribute('position', new THREE.BufferAttribute(gkGroundPositions, 3));
+  const gkGroundMat = new THREE.LineBasicMaterial({
+    color: 0xd9f938,
+    linewidth: 3,
+    transparent: true,
+    opacity: 0.95,
+  });
+  const goalKickGroundLine = new THREE.Line(gkGroundGeo, gkGroundMat);
+
+  const goalKickArrowHead = new THREE.Group();
+  const arrowConeGeo = new THREE.ConeGeometry(0.68, 1.65, 3);
+  arrowConeGeo.rotateZ(-Math.PI / 2);
+  arrowConeGeo.rotateX(Math.PI / 2);
+  const arrowConeMat = new THREE.MeshBasicMaterial({
+    color: 0xd9f938,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.92,
+    depthWrite: false,
+  });
+  const arrowConeMesh = new THREE.Mesh(arrowConeGeo, arrowConeMat);
+  const arrowRingGeo = new THREE.RingGeometry(0.95, 1.32, 24);
+  arrowRingGeo.rotateX(-Math.PI / 2);
+  const arrowRingMesh = new THREE.Mesh(arrowRingGeo, arrowConeMat);
+  goalKickArrowHead.add(arrowConeMesh, arrowRingMesh);
+
+  const goalKickTrajectoryGroup = new THREE.Group();
+  goalKickTrajectoryGroup.add(goalKickGroundLine, goalKickArrowHead);
+  goalKickTrajectoryGroup.visible = false;
+  scene.add(goalKickTrajectoryGroup);
 
   // 9b. 3D TV Replay Ball Trajectory Trail & Goalscorer Highlight Ring
   const trailPointsCount = 48;
@@ -2421,9 +2731,9 @@ export function createMatchScene3D(
   scorerHighlightGroup.visible = false;
   scene.add(scorerHighlightGroup);
 
-  // 9c. 3D VAR Offside Laser Line & Glowing Plane
+  // 9c. 3D VAR Offside Laser Line & Glowing Plane (spanning full 90m width)
   const varOffsideGroup = new THREE.Group();
-  const varLineGeo = new THREE.PlaneGeometry(0.32, PITCH.WIDTH);
+  const varLineGeo = new THREE.PlaneGeometry(0.32, WORLD_PITCH.WIDTH);
   varLineGeo.rotateX(-Math.PI / 2);
   const varLineMat = new THREE.MeshBasicMaterial({
     color: 0xef4444,
@@ -2435,7 +2745,7 @@ export function createMatchScene3D(
   const varLineMesh = new THREE.Mesh(varLineGeo, varLineMat);
   varLineMesh.position.y = 0.035;
 
-  const varWallGeo = new THREE.PlaneGeometry(PITCH.WIDTH, 2.2);
+  const varWallGeo = new THREE.PlaneGeometry(WORLD_PITCH.WIDTH, 2.2);
   varWallGeo.rotateY(Math.PI / 2);
   const varWallMat = new THREE.MeshBasicMaterial({
     color: 0x38bdf8,
@@ -2495,9 +2805,9 @@ export function createMatchScene3D(
     const pCount = isSoftwareGl ? (isStorm ? 360 : 250) : isStorm ? 950 : 700;
     const positions = new Float32Array(pCount * 3);
     for (let i = 0; i < pCount; i++) {
-      positions[i * 3] = (Math.random() - 0.5) * 110;
-      positions[i * 3 + 1] = Math.random() * 26;
-      positions[i * 3 + 2] = (Math.random() - 0.5) * 74;
+      positions[i * 3] = (Math.random() - 0.5) * 145;
+      positions[i * 3 + 1] = Math.random() * 28;
+      positions[i * 3 + 2] = (Math.random() - 0.5) * 95;
     }
     const pGeo = new THREE.BufferGeometry();
     pGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -2553,15 +2863,44 @@ export function createMatchScene3D(
     return rig;
   };
 
-  // Camera state & reusable active player set (zero per-frame GC allocation)
-  const camTargetPos = new THREE.Vector3(0, 15.2, 35.5);
-  const camLookAt = new THREE.Vector3(0, 0.9, -4.5);
-  const currentLookAt = new THREE.Vector3(0, 0.9, -4.5);
-  const crowdDummy = new THREE.Object3D();
+  // Pre-allocated camera, frustum culling, and dynamic resolution scaler state (Zero GC allocations per frame)
+  const camTargetPos = new THREE.Vector3(0, 21.8, 48.2);
+  const camLookAt = new THREE.Vector3(0, 0.9, -5.5);
+  const currentLookAt = new THREE.Vector3(0, 0.9, -5.5);
   const activeSet = new Set<string>();
+  const frustum = new THREE.Frustum();
+  const projScreenMatrix = new THREE.Matrix4();
   let hadActiveParticles = true;
-  let lastCrowdAnimMs = 0;
-  let crowdWasRested = true;
+
+  // Dynamic Resolution Scaler (Optimization #9: drops render scale after >2s below target FPS and recovers when stable)
+  const targetFps = quality === 'baja' ? 30 : 60;
+  let currentRenderScale = 1.0;
+  let smoothedFps = targetFps;
+  let smoothedFrameTimeMs = 1000 / targetFps;
+  let lowFpsDurationSec = 0;
+  let stableFpsDurationSec = 0;
+  let activeSectorCount = cullableSectors.length;
+  let culledSectorCount = 0;
+
+  const getPerformanceTelemetry = (): StadiumPerformanceTelemetry => ({
+    fps: Math.round(smoothedFps),
+    frameTimeMs: Number(smoothedFrameTimeMs.toFixed(2)),
+    targetFps,
+    renderScalePct: Math.round(currentRenderScale * 100),
+    drawCalls: renderer.info.render.calls,
+    triangles: renderer.info.render.triangles,
+    pitchDimensionsM: `${WORLD_PITCH.LENGTH} x ${WORLD_PITCH.WIDTH} m`,
+    pitchScaleFactor: Number(EXPANDED_PITCH_SCALE.FACTOR.toFixed(4)),
+    stadiumCapacity: EXPANDED_PITCH_SCALE.STADIUM_CAPACITY,
+    gpuInstancedCrowdCount: nearCrowdCount,
+    billboardCrowdCount,
+    lightTowerCount: towerLodObjects.length,
+    activeSectors: activeSectorCount,
+    culledSectors: culledSectorCount,
+    timeOfDay: activeTimeOfDay,
+    qualityTier: quality,
+    isSoftwareGl,
+  });
 
   if (!isSoftwareGl) {
     renderer.compile(scene, camera);
@@ -2640,8 +2979,9 @@ export function createMatchScene3D(
       replayBallTrailLine.visible = false;
     }
 
-    // 2. Physical 3D Goal Net Elastic Deformation & Ripple on Ball Impact / Goal Celebration
-    const isNearGoalNet = Math.abs(worldBallX) > PITCH.HALF_X - 1.1 && Math.abs(worldBallZ) < PITCH.GOAL_HALF + 0.3;
+    // 2. Physical 3D Goal Net Elastic Deformation & Ripple on Ball Impact / Goal Celebration (140x90m WORLD_PITCH)
+    const isNearGoalNet =
+      Math.abs(worldBallX) > WORLD_PITCH.HALF_X - 1.4 && Math.abs(worldBallZ) < WORLD_PITCH.GOAL_HALF + 0.4;
     const netRipple =
       eng.phase === 'goal_celebration' || (isReplay && isNearGoalNet)
         ? Math.sin(nowMs * 0.032) * 0.32
@@ -2654,14 +2994,14 @@ export function createMatchScene3D(
     leftGoal.netMeshes.forEach((nm, idx) => {
       const wave = Math.sin(nowMs * 0.035 + idx * 1.2) * stretchLeft * 0.35;
       if (idx === 0) {
-        nm.position.x = -PITCH.HALF_X - PITCH.GOAL_DEPTH - stretchLeft;
+        nm.position.x = -WORLD_PITCH.HALF_X - WORLD_PITCH.GOAL_DEPTH - stretchLeft;
       }
       nm.scale.set(1 + stretchLeft * 0.18 + wave * 0.08, 1 + stretchLeft * 0.12, 1 + wave * 0.08);
     });
     rightGoal.netMeshes.forEach((nm, idx) => {
       const wave = Math.sin(nowMs * 0.035 + idx * 1.2) * stretchRight * 0.35;
       if (idx === 0) {
-        nm.position.x = PITCH.HALF_X + PITCH.GOAL_DEPTH + stretchRight;
+        nm.position.x = WORLD_PITCH.HALF_X + WORLD_PITCH.GOAL_DEPTH + stretchRight;
       }
       nm.scale.set(1 + stretchRight * 0.18 + wave * 0.08, 1 + stretchRight * 0.12, 1 + wave * 0.08);
     });
@@ -2700,7 +3040,7 @@ export function createMatchScene3D(
     } else {
       lightningGroup.visible = false;
       renderer.toneMappingExposure =
-        settings.match.timeOfDay === 'dia' ? 1.08 : settings.match.timeOfDay === 'atardecer' ? 1.04 : 1.06;
+        activeTimeOfDay === 'dia' ? 1.08 : activeTimeOfDay === 'atardecer' ? 1.04 : 1.06;
     }
 
     // 3. Update & Smoothly Blend 22 3D Sculpted Players (All Mocap Skeletal States + Two-Handed Throw-In + Foot IK)
@@ -2753,6 +3093,26 @@ export function createMatchScene3D(
       rig.root.position.set(wx, 0, wz);
       rig.root.rotation.y = -facing + Math.PI / 2;
 
+      const isTitan = Boolean(p.isRacingTitan && isRacingTitansMasterFlagEnabled());
+      const titanScale = isTitan
+        ? p.titanScale ?? RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE
+        : 1.0;
+      const shadowScale = isTitan ? RACING_TITANS_CONFIG.TITAN_SHADOW_SCALE : 1.0;
+      rig.bodyGroup.scale.set(
+        rig.baseScaleXZ * titanScale,
+        rig.baseScaleY * titanScale,
+        rig.baseScaleXZ * titanScale
+      );
+      rig.contactShadow.scale.set(shadowScale, shadowScale, 1);
+      rig.contactShadow.updateMatrix();
+      rig.directionArrow.position.set(0, 0.04, 1.02 * (isTitan ? titanScale * 0.72 : 1));
+      rig.directionArrow.scale.set(
+        isTitan ? 1.65 : 1,
+        isTitan ? 1.65 : 1,
+        isTitan ? 1.65 : 1
+      );
+      rig.directionArrow.updateMatrix();
+
       if (p.id === eng.replayScorerId) {
         scorerWorldPos = { x: wx, z: wz };
       }
@@ -2768,6 +3128,7 @@ export function createMatchScene3D(
       rig.activeRing.visible = isUserActive || isTargetedReceiver;
       rig.overheadCursor.visible = isUserActive;
       rig.directionArrow.visible = isUserActive;
+      const ringMult = isTitan ? titanScale * 0.78 : 1.0;
       if (isUserActive) {
         const indicatorColor = isUser2Active
           ? 0x06b6d4
@@ -2776,13 +3137,19 @@ export function createMatchScene3D(
           : 0xef4444;
         (rig.activeRing.material as THREE.MeshBasicMaterial).color.setHex(indicatorColor);
         (rig.overheadCursor.material as THREE.MeshBasicMaterial).color.setHex(indicatorColor);
-        const pulse = 1 + Math.sin(nowMs * 0.008) * 0.06;
+        const pulse = (1 + Math.sin(nowMs * 0.008) * 0.06) * ringMult;
         rig.activeRing.scale.set(pulse, pulse, 1);
-        rig.overheadCursor.position.y = 3.02 + Math.sin(nowMs * 0.009) * 0.08;
+        rig.overheadCursor.position.y =
+          (3.02 + Math.sin(nowMs * 0.009) * 0.08) * (isTitan ? titanScale * 0.86 : 1);
+        rig.overheadCursor.scale.set(
+          isTitan ? 1.7 : 1,
+          isTitan ? 1.7 : 1,
+          isTitan ? 1.7 : 1
+        );
         rig.overheadCursor.rotation.y = nowMs * 0.0025;
       } else if (isTargetedReceiver) {
         (rig.activeRing.material as THREE.MeshBasicMaterial).color.setHex(0x38bdf8);
-        const pulse = 0.92 + Math.sin(nowMs * 0.012) * 0.08;
+        const pulse = (0.92 + Math.sin(nowMs * 0.012) * 0.08) * ringMult;
         rig.activeRing.scale.set(pulse, pulse, 1);
       }
 
@@ -3019,6 +3386,10 @@ export function createMatchScene3D(
         }
       }
 
+      if (isTitan && targetBodyY < 0) {
+        targetBodyY = 0;
+      }
+
       rig.bodyGroup.position.y = THREE.MathUtils.damp(rig.bodyGroup.position.y, targetBodyY, animDamp, dt);
       rig.bodyGroup.rotation.x = THREE.MathUtils.damp(rig.bodyGroup.rotation.x, targetBodyPitch, animDamp, dt);
       rig.bodyGroup.rotation.y = THREE.MathUtils.damp(rig.bodyGroup.rotation.y, targetTorsoYaw, animDamp, dt);
@@ -3090,8 +3461,8 @@ export function createMatchScene3D(
       if (refereeRig.cardMesh) refereeRig.cardMesh.visible = false;
     }
 
-    animateCoachRig(homeCoachRig, eng.homeCoachMood, nowMs, dt, -11);
-    animateCoachRig(awayCoachRig, eng.awayCoachMood, nowMs + 700, dt, 11);
+    animateCoachRig(homeCoachRig, eng.homeCoachMood, nowMs, dt, -14.5);
+    animateCoachRig(awayCoachRig, eng.awayCoachMood, nowMs + 700, dt, 14.5);
 
     // 5. Update 3D Turf, Dust & Spark Particles (skip GPU upload when idle)
     const pEvents = eng.particleEvents;
@@ -3121,9 +3492,58 @@ export function createMatchScene3D(
       if (particleInstanced.instanceColor) particleInstanced.instanceColor.needsUpdate = true;
     }
 
-    // 6. Update 3D Free Kick Trajectory Arc Preview
-    if (eng.phase === 'set_piece' && eng.freeKickState?.awaitingUserInput && !eng.freeKickState.isInMatchPenalty) {
+    // 6. Update 3D Free Kick & Goal Kick Trajectory Arc / Grass Line Preview
+    if (eng.phase === 'GOAL_KICK_AIM' && eng.goalKickAimState) {
+      const gkAim = eng.goalKickAimState;
+      const worldAimAngle = (gkAim.team === 'home' ? 0 : Math.PI) + gkAim.aimAngleRad;
+      const elev = Math.max(0, Math.min(1, gkAim.elevationSlider));
+      const activeCharge =
+        shootChargePct > 0.05
+          ? shootChargePct
+          : gkAim.chargePower > 0.05
+          ? gkAim.chargePower
+          : 0.65;
+      const combinedPower = Math.max(0.18, Math.min(1.0, elev * 0.55 + activeCharge * 0.45));
+      const kickDistance = 16 + combinedPower * 54;
+      const peakHeight =
+        elev < 0.22 ? 0.16 : elev * 7.2 * (0.65 + activeCharge * 0.35);
+
       freeKickArcLine.visible = true;
+      goalKickTrajectoryGroup.visible = true;
+
+      const startWx = physToWorldX(eng.ball.x);
+      const startWz = physToWorldZ(eng.ball.y);
+      const endPhysX = Math.max(
+        2,
+        Math.min(PITCH.LENGTH - 2, eng.ball.x + Math.cos(worldAimAngle) * kickDistance)
+      );
+      const endPhysY = Math.max(
+        2,
+        Math.min(PITCH.WIDTH - 2, eng.ball.y + Math.sin(worldAimAngle) * kickDistance)
+      );
+      const endWx = physToWorldX(endPhysX);
+      const endWz = physToWorldZ(endPhysY);
+
+      const posAttr = freeKickArcLine.geometry.getAttribute('position') as THREE.BufferAttribute;
+      const groundAttr = goalKickGroundLine.geometry.getAttribute('position') as THREE.BufferAttribute;
+      for (let k = 0; k < arcPointsCount; k++) {
+        const t = k / (arcPointsCount - 1);
+        const wx = startWx + (endWx - startWx) * t;
+        const wz = startWz + (endWz - startWz) * t;
+        const wy = 0.12 + Math.sin(t * Math.PI) * peakHeight;
+        posAttr.setXYZ(k, wx, wy, wz);
+        groundAttr.setXYZ(k, wx, 0.06, wz);
+      }
+      posAttr.needsUpdate = true;
+      groundAttr.needsUpdate = true;
+
+      goalKickArrowHead.position.set(endWx, 0.07, endWz);
+      goalKickArrowHead.rotation.y = -worldAimAngle;
+      const pulse = 1 + Math.sin(nowMs * 0.01) * 0.08;
+      goalKickArrowHead.scale.set(pulse, 1, pulse);
+    } else if (eng.phase === 'set_piece' && eng.freeKickState?.awaitingUserInput && !eng.freeKickState.isInMatchPenalty) {
+      freeKickArcLine.visible = true;
+      goalKickTrajectoryGroup.visible = false;
       const fk = eng.freeKickState;
       const oppGoalX = eng.restartTeam === 'home' ? PITCH.LENGTH : 0;
       const targetY = PITCH.HALF_Y + fk.aimOffset * (PITCH.GOAL_HALF - 0.1);
@@ -3158,9 +3578,10 @@ export function createMatchScene3D(
       posAttr.needsUpdate = true;
     } else {
       freeKickArcLine.visible = false;
+      goalKickTrajectoryGroup.visible = false;
     }
 
-    // 7. Crowd, Flags, Camera Flashes & Flares Animation
+    // 7. GPU Vertex-Shader Crowd & Flags Animation + Camera Flashes & Flares (Optimization #2: Zero CPU matrix loops)
     flaresGroup.visible = eng.phase === 'goal_celebration' || eng.matchMinute < 4;
     const isFlashMoment =
       eng.phase === 'goal_celebration' ||
@@ -3174,41 +3595,11 @@ export function createMatchScene3D(
       cameraFlashes.rotation.y = Math.sin(nowMs * 0.01) * 0.02;
     }
 
-    const isCrowdActive = eng.phase === 'goal_celebration' || eng.crowdMood !== 'calm';
-    if (isCrowdActive && nowMs - lastCrowdAnimMs > 52) {
-      lastCrowdAnimMs = nowMs;
-      crowdWasRested = false;
-      const isExcited = eng.phase === 'goal_celebration' || eng.crowdMood === 'goal_roar';
-      const isDanger = eng.crowdMood === 'dangerous_play' || eng.crowdMood === 'save_applause';
-      const waveAmp = isExcited ? 0.52 : isDanger ? 0.28 : 0.12;
-      const waveSpeed = isExcited ? 0.013 : isDanger ? 0.008 : 0.004;
-
-      const crowdMatArr = crowdMesh.instanceMatrix.array as Float32Array;
-      for (let i = 0; i < crowdBasePositions.length; i++) {
-        const bp = crowdBasePositions[i];
-        const dy = Math.max(0, Math.sin(nowMs * waveSpeed + bp.phase)) * waveAmp;
-        crowdMatArr[i * 16 + 13] = bp.y + dy;
-      }
-      crowdMesh.instanceMatrix.needsUpdate = true;
-
-      for (let i = 0; i < flagBasePositions.length; i++) {
-        const fp = flagBasePositions[i];
-        const dy = Math.max(0, Math.sin(nowMs * waveSpeed + fp.phase)) * waveAmp;
-        crowdDummy.position.set(fp.x, fp.y + dy, fp.z);
-        crowdDummy.lookAt(0, 2, 0);
-        crowdDummy.rotation.z = Math.sin(nowMs * (waveSpeed * 1.4) + fp.phase) * (isExcited ? 0.55 : 0.25);
-        crowdDummy.updateMatrix();
-        flagsMesh.setMatrixAt(i, crowdDummy.matrix);
-      }
-      flagsMesh.instanceMatrix.needsUpdate = true;
-    } else if (!isCrowdActive && !crowdWasRested) {
-      crowdWasRested = true;
-      const crowdMatArr = crowdMesh.instanceMatrix.array as Float32Array;
-      for (let i = 0; i < crowdBasePositions.length; i++) {
-        crowdMatArr[i * 16 + 13] = crowdBasePositions[i].y;
-      }
-      crowdMesh.instanceMatrix.needsUpdate = true;
-    }
+    const isExcited = eng.phase === 'goal_celebration' || eng.crowdMood === 'goal_roar';
+    const isDanger = eng.crowdMood === 'dangerous_play' || eng.crowdMood === 'save_applause';
+    crowdShaderCtrl.uTime.value = nowMs * 0.001;
+    crowdShaderCtrl.uWaveAmp.value = isExcited ? 0.54 : isDanger ? 0.28 : 0.08;
+    crowdShaderCtrl.uWaveSpeed.value = isExcited ? 11.5 : isDanger ? 7.2 : 3.4;
 
     // 8. Weather Particles Animation
     if (weatherPoints) {
@@ -3229,126 +3620,198 @@ export function createMatchScene3D(
       posAttr.needsUpdate = true;
     }
 
-    // 9. EA SPORTS FC TV Broadcast Camera System with Cutscenes & 3 Interactive Replay Camera Angles
+    // 9. EA SPORTS FC TV Broadcast Camera System Scaled for Expanded 140 x 90 m Pitch (FACTOR = 1.3333)
     const zoomFactor = 1 / Math.max(0.75, Math.min(1.35, cameraZoom));
+    const camScale = EXPANDED_PITCH_SCALE.CAMERA_SCALE; // 1.3333334
 
     if (eng.varReviewState?.active) {
       const vx = physToWorldX(eng.varReviewState.focusX);
       const vz = physToWorldZ(eng.varReviewState.focusY);
       if (eng.varReviewState.cameraAngleIndex === 1) {
-        camTargetPos.set(vx, 12.2, 31.0);
+        camTargetPos.set(vx, 14.5, 38.0);
         camLookAt.set(vx, 0.85, vz * 0.4 - 1.5);
       } else if (eng.varReviewState.cameraAngleIndex === 2) {
-        camTargetPos.set(vx - 6.5, 2.8, vz + 9.2);
+        camTargetPos.set(vx - 7.8, 3.2, vz + 11.2);
         camLookAt.set(vx, 1.05, vz);
       } else {
-        camTargetPos.set(vx + 4.8, 5.4, vz + 13.5);
+        camTargetPos.set(vx + 5.8, 6.2, vz + 16.5);
         camLookAt.set(vx, 1.15, vz);
       }
     } else if (eng.cutsceneState?.active && (eng.cutsceneState.type === 'yellow_card' || eng.cutsceneState.type === 'red_card')) {
       // Cinemática de Tarjeta Amarilla / Roja: zoom dramático enfocando al árbitro y al infractor
       const cx = physToWorldX(eng.cutsceneState.focusX);
       const cz = physToWorldZ(eng.cutsceneState.focusY);
-      camTargetPos.set(cx - 1.1, 3.1, cz + 6.8);
+      camTargetPos.set(cx - 1.2, 3.2, cz + 7.2);
       camLookAt.set(cx - 0.4, 1.38, cz);
     } else if (eng.cutsceneState?.active && eng.cutsceneState.type === 'corner') {
       // Cinemática de Tiro de Esquina: detrás del ejecutante en el banderín mirando hacia los cabeceadores en el área
       const cx = physToWorldX(eng.cutsceneState.focusX);
       const cz = physToWorldZ(eng.cutsceneState.focusY);
-      const goalX = eng.cutsceneState.teamSide === 'home' ? PITCH.HALF_X : -PITCH.HALF_X;
+      const goalX = eng.cutsceneState.teamSide === 'home' ? WORLD_PITCH.HALF_X : -WORLD_PITCH.HALF_X;
       const signX = cx < 0 ? -1 : 1;
       const signZ = cz < 0 ? -1 : 1;
-      camTargetPos.set(cx + signX * 4.5, 3.4, cz + signZ * 4.5);
-      camLookAt.set(goalX - signX * 9.5, 1.4, 0);
+      camTargetPos.set(cx + signX * 5.2, 3.6, cz + signZ * 5.2);
+      camLookAt.set(goalX - signX * 11.5, 1.4, 0);
     } else if (eng.cutsceneState?.active && eng.cutsceneState.type === 'throw_in') {
       // Cinemática de Saque de Banda: encuadre del jugador sosteniendo el balón con ambas manos en la línea de cal
       const cx = physToWorldX(eng.cutsceneState.focusX);
       const cz = physToWorldZ(eng.cutsceneState.focusY);
       const signZ = cz < 0 ? -1 : 1;
-      camTargetPos.set(cx - 3.8, 2.9, cz + signZ * 5.2);
-      camLookAt.set(cx + 2.5, 1.35, cz - signZ * 6.5);
+      camTargetPos.set(cx - 4.2, 3.1, cz + signZ * 5.8);
+      camLookAt.set(cx + 2.8, 1.35, cz - signZ * 7.5);
     } else if (eng.cardCutscene?.active) {
       const cx = physToWorldX(eng.cardCutscene.x);
       const cz = physToWorldZ(eng.cardCutscene.y);
-      camTargetPos.set(cx - 0.8, 3.2, cz + 7.2);
+      camTargetPos.set(cx - 0.9, 3.3, cz + 7.6);
       camLookAt.set(cx - 0.5, 1.35, cz);
     } else if (eng.offsideCutscene?.active) {
       const lx = physToWorldX(eng.offsideCutscene.lineX);
       const lz = physToWorldZ(eng.offsideCutscene.y);
-      camTargetPos.set(lx, 11.5, 31.5);
+      camTargetPos.set(lx, 13.8, 38.5);
       camLookAt.set(lx, 0.8, lz * 0.4 - 2.0);
+    } else if (eng.phase === 'GOAL_KICK_AIM' && eng.goalKickAimState) {
+      // Cámara de saque: elevada y detrás del arquero mirando hacia el campo rival con transición suave
+      const gkAim = eng.goalKickAimState;
+      const baseDir = gkAim.team === 'home' ? 1 : -1;
+      const worldAimAngle = (gkAim.team === 'home' ? 0 : Math.PI) + gkAim.aimAngleRad;
+      const forwardX = Math.cos(worldAimAngle);
+      const forwardZ = Math.sin(worldAimAngle);
+      camTargetPos.set(
+        worldBallX - baseDir * 14.5 - forwardX * 2.5,
+        7.2,
+        worldBallZ - forwardZ * 10.5
+      );
+      camLookAt.set(
+        worldBallX + forwardX * 42.0,
+        1.15,
+        worldBallZ + forwardZ * 42.0
+      );
     } else if (eng.phase === 'penalty_shootout' || (eng.phase === 'set_piece' && eng.restartType === 'penalty')) {
       const isRightGoal = eng.phase === 'penalty_shootout' || eng.restartTeam === 'home';
       const dir = isRightGoal ? 1 : -1;
-      const penSpotX = dir * (PITCH.HALF_X - PITCH.PENALTY_SPOT_X);
-      camTargetPos.set(penSpotX - dir * 9.5, 3.6, 0);
-      camLookAt.set(dir * PITCH.HALF_X, 1.4, 0);
+      const penSpotX = dir * (WORLD_PITCH.HALF_X - WORLD_PITCH.PENALTY_SPOT_X);
+      camTargetPos.set(penSpotX - dir * 11.2, 3.9, 0);
+      camLookAt.set(dir * WORLD_PITCH.HALF_X, 1.45, 0);
     } else if (eng.phase === 'set_piece' && eng.freeKickState?.awaitingUserInput) {
       const dir = eng.restartTeam === 'home' ? 1 : -1;
-      const goalX = dir * PITCH.HALF_X;
+      const goalX = dir * WORLD_PITCH.HALF_X;
       const dx = goalX - worldBallX;
       const dz = 0 - worldBallZ;
       const d = Math.max(1, Math.hypot(dx, dz));
-      camTargetPos.set(worldBallX - (dx / d) * 10.5, 4.2, worldBallZ - (dz / d) * 10.5);
-      camLookAt.set(goalX, 1.45, eng.freeKickState.aimOffset * PITCH.GOAL_HALF);
+      camTargetPos.set(worldBallX - (dx / d) * 12.2, 4.5, worldBallZ - (dz / d) * 12.2);
+      camLookAt.set(goalX, 1.45, eng.freeKickState.aimOffset * WORLD_PITCH.GOAL_HALF);
     } else if (eng.phase === 'goal_celebration') {
-      const focusX = scorerWorldPos ? scorerWorldPos.x : THREE.MathUtils.clamp(worldBallX, -46, 46);
+      const focusX = scorerWorldPos ? scorerWorldPos.x : THREE.MathUtils.clamp(worldBallX, -62, 62);
       const focusZ = scorerWorldPos ? scorerWorldPos.z : worldBallZ;
-      const orbitX = Math.sin(nowMs * 0.002) * 5.5;
-      camTargetPos.set(focusX + orbitX, 5.6, focusZ + 11.8);
+      const orbitX = Math.sin(nowMs * 0.002) * 6.5;
+      camTargetPos.set(focusX + orbitX, 6.2, focusZ + 13.5);
       camLookAt.set(focusX, 1.35, focusZ);
     } else if (isReplay) {
-      const focusX = THREE.MathUtils.clamp(worldBallX, -49, 49);
+      const focusX = THREE.MathUtils.clamp(worldBallX, -65, 65);
       const goalDir = focusX >= 0 ? 1 : -1;
-      const targetGoalX = goalDir * PITCH.HALF_X;
+      const targetGoalX = goalDir * WORLD_PITCH.HALF_X;
 
       if (eng.replayCameraAngle === 'broadcast_slow') {
-        camTargetPos.set(focusX * 0.82, 13.5, worldBallZ * 0.55 + 26.5);
+        camTargetPos.set(focusX * 0.82, 16.5, worldBallZ * 0.55 + 32.5);
         camLookAt.set(worldBallX, 0.95, worldBallZ * 0.85 - 2.5);
       } else if (eng.replayCameraAngle === 'low_sideline_slow') {
         // Cámara Libre 360° (permite orbitar alrededor de la jugada con replayFreeCamAngle)
         const freeAngle = eng.replayFreeCamAngle || 0;
-        const radius = 13.5;
+        const radius = 15.5;
         camTargetPos.set(
           worldBallX + Math.sin(freeAngle) * radius,
-          3.4,
+          3.8,
           worldBallZ + Math.cos(freeAngle) * radius
         );
         camLookAt.set(worldBallX, 1.05, worldBallZ);
       } else {
         // Detrás del Arco (behind_goal_zoom)
-        camTargetPos.set(targetGoalX + goalDir * 7.5, 3.4, worldBallZ * 0.45);
+        camTargetPos.set(targetGoalX + goalDir * 8.8, 3.8, worldBallZ * 0.45);
         camLookAt.set(worldBallX, Math.max(0.85, worldBallY), worldBallZ);
       }
     } else if (cameraMode === 'panoramica') {
-      const cx = THREE.MathUtils.clamp(worldBallX * 0.55, -26, 26);
-      const cz = THREE.MathUtils.clamp(worldBallZ * 0.35, -10, 10);
-      camTargetPos.set(cx, 33 * zoomFactor, cz + 46 * zoomFactor);
-      camLookAt.set(cx, 0, cz - 3);
+      const titanCamH =
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_HEIGHT_MULT
+          : 1.0;
+      const titanCamD =
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_DIST_MULT
+          : 1.0;
+      const cx = THREE.MathUtils.clamp(worldBallX * 0.55, -38, 38);
+      const cz = THREE.MathUtils.clamp(worldBallZ * 0.35, -16, 16);
+      camTargetPos.set(
+        cx,
+        39.5 * camScale * 0.85 * zoomFactor * titanCamH,
+        cz + 54 * camScale * 0.85 * zoomFactor * titanCamD
+      );
+      camLookAt.set(
+        cx,
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_LOOK_Y * 0.5
+          : 0,
+        cz - 3.5
+      );
     } else if (cameraMode === 'dinamica') {
-      const cx = THREE.MathUtils.clamp(worldBallX * 0.9, -44, 44);
-      const cz = THREE.MathUtils.clamp(worldBallZ * 0.78, -24, 24);
-      camTargetPos.set(cx * 0.94, 13.8 * zoomFactor, cz + 23.0 * zoomFactor);
-      camLookAt.set(worldBallX * 0.98, 0.75, worldBallZ * 0.85 - 2.5);
+      const titanCamH =
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_HEIGHT_MULT
+          : 1.0;
+      const titanCamD =
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_DIST_MULT
+          : 1.0;
+      const cx = THREE.MathUtils.clamp(worldBallX * 0.9, -58, 58);
+      const cz = THREE.MathUtils.clamp(worldBallZ * 0.78, -32, 32);
+      camTargetPos.set(
+        cx * 0.94,
+        17.8 * camScale * 0.88 * zoomFactor * titanCamH,
+        cz + 29.5 * camScale * 0.88 * zoomFactor * titanCamD
+      );
+      camLookAt.set(
+        worldBallX * 0.98,
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_LOOK_Y
+          : 0.75,
+        worldBallZ * 0.85 - 2.8
+      );
     } else {
-      const teleMult = cameraMode === 'tele' ? 0.88 : 1.0;
-      const boxProximity = Math.max(0, (Math.abs(worldBallX) - 18) / 30);
-      const ballSpeedZoomOut = Math.min(1.5, Math.hypot(eng.ball.vx, eng.ball.vy) * 0.04);
+      const teleMult = cameraMode === 'tele' ? 0.90 : 1.0;
+      const titanCamH =
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_HEIGHT_MULT
+          : 1.0;
+      const titanCamD =
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_DIST_MULT
+          : 1.0;
+      const boxProximity = Math.max(0, (Math.abs(worldBallX) - 26) / 42);
+      const ballSpeedZoomOut = Math.min(2.2, Math.hypot(eng.ball.vx, eng.ball.vy) * 0.055);
 
-      const dynamicHeight = (14.6 - boxProximity * 2.1 + ballSpeedZoomOut * 0.5) * zoomFactor * teleMult;
-      const dynamicDistZ = (33.8 - boxProximity * 3.8 + ballSpeedZoomOut * 0.8) * zoomFactor * teleMult;
+      const dynamicHeight =
+        (21.4 - boxProximity * 2.5 + ballSpeedZoomOut * 0.75) *
+        zoomFactor *
+        teleMult *
+        titanCamH;
+      const dynamicDistZ =
+        (47.2 - boxProximity * 4.5 + ballSpeedZoomOut * 1.15) *
+        zoomFactor *
+        teleMult *
+        titanCamD;
 
-      const cx = THREE.MathUtils.clamp(worldBallX * 0.86 + eng.ball.vx * 0.14, -38, 38);
-      const cz = THREE.MathUtils.clamp(worldBallZ * 0.45 + eng.ball.vy * 0.08, -11, 13);
+      const cx = THREE.MathUtils.clamp(worldBallX * 0.84 + eng.ball.vx * 0.15, -52, 52);
+      const cz = THREE.MathUtils.clamp(worldBallZ * 0.48 + eng.ball.vy * 0.10, -18, 20);
 
-      const attackBias = worldBallX >= -4 ? 1 : -1;
-      const diagonalCamShift = attackBias * 8.5 + worldBallX * 0.16;
+      const attackBias = worldBallX >= -5 ? 1 : -1;
+      const diagonalCamShift = attackBias * 9.6 + worldBallX * 0.15;
 
       camTargetPos.set(cx - diagonalCamShift, dynamicHeight, cz + dynamicDistZ);
       camLookAt.set(
-        THREE.MathUtils.clamp(cx + attackBias * 5.2 + eng.ball.vx * 0.15, -45, 45),
-        0.95,
-        cz * 0.62 - 6.8
+        THREE.MathUtils.clamp(cx + attackBias * 6.0 + eng.ball.vx * 0.18, -60, 60),
+        eng.hasActiveRacingTitans && isRacingTitansMasterFlagEnabled()
+          ? RACING_TITANS_CONFIG.TITAN_CAMERA_LOOK_Y
+          : 0.85,
+        cz * 0.62 - 7.5
       );
     }
 
@@ -3361,7 +3824,7 @@ export function createMatchScene3D(
     const isSetPieceFocus =
       eng.phase === 'penalty_shootout' ||
       (eng.phase === 'set_piece' && (eng.restartType === 'penalty' || Boolean(eng.freeKickState?.awaitingUserInput)));
-    const camDamp = isSetPieceFocus ? 28 : eng.cutsceneState?.active ? 7.5 : isReplay ? 6.5 : 4.8;
+    const camDamp = isSetPieceFocus ? 28 : eng.cutsceneState?.active ? 7.5 : isReplay ? 6.5 : 5.8;
     camera.position.x = THREE.MathUtils.damp(camera.position.x, camTargetPos.x, camDamp, dt);
     camera.position.y = THREE.MathUtils.damp(camera.position.y, camTargetPos.y, camDamp, dt);
     camera.position.z = THREE.MathUtils.damp(camera.position.z, camTargetPos.z, camDamp, dt);
@@ -3371,6 +3834,55 @@ export function createMatchScene3D(
     currentLookAt.z = THREE.MathUtils.damp(currentLookAt.z, camLookAt.z, camDamp * 1.25, dt);
     camera.lookAt(currentLookAt);
 
+    // 10. Zero-GC Sector Frustum Culling & 3-Level Floodlight Tower LOD Update (Optimizations #4 & #6)
+    camera.updateMatrixWorld();
+    projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(projScreenMatrix);
+
+    let visSectors = 0;
+    let hidSectors = 0;
+    for (let sIdx = 0; sIdx < cullableSectors.length; sIdx++) {
+      const sec = cullableSectors[sIdx];
+      // Exterior city is also culled automatically when camera is low (< 14m height)
+      const isLowCamExterior = sec.name === 'ExteriorCity' && camera.position.y < 14.0;
+      const inView = !isLowCamExterior && frustum.intersectsSphere(sec.bounds);
+      sec.group.visible = inView;
+      if (inView) visSectors++;
+      else hidSectors++;
+    }
+    activeSectorCount = visSectors;
+    culledSectorCount = hidSectors;
+
+    for (let tIdx = 0; tIdx < towerLodObjects.length; tIdx++) {
+      towerLodObjects[tIdx].update(camera);
+    }
+
+    // 11. Dynamic Resolution Scaler (Optimization #9: drops render resolution after >2s below target FPS, restores when stable)
+    const safeDt = Math.max(0.001, Math.min(0.25, dt));
+    const instFps = 1 / safeDt;
+    smoothedFps = smoothedFps * 0.92 + instFps * 0.08;
+    smoothedFrameTimeMs = smoothedFrameTimeMs * 0.92 + safeDt * 1000 * 0.08;
+
+    if (smoothedFps < targetFps * 0.92) {
+      lowFpsDurationSec += safeDt;
+      stableFpsDurationSec = 0;
+      if (lowFpsDurationSec >= 2.0 && currentRenderScale > 0.68) {
+        currentRenderScale = Math.max(0.68, Number((currentRenderScale - 0.10).toFixed(2)));
+        renderer.setPixelRatio(baseDevicePixelRatio * currentRenderScale);
+        lowFpsDurationSec = 0;
+      }
+    } else if (smoothedFps >= targetFps * 0.97) {
+      lowFpsDurationSec = Math.max(0, lowFpsDurationSec - safeDt * 0.5);
+      if (currentRenderScale < 1.0) {
+        stableFpsDurationSec += safeDt;
+        if (stableFpsDurationSec >= 2.5) {
+          currentRenderScale = Math.min(1.0, Number((currentRenderScale + 0.08).toFixed(2)));
+          renderer.setPixelRatio(baseDevicePixelRatio * currentRenderScale);
+          stableFpsDurationSec = 0;
+        }
+      }
+    }
+
     renderer.render(scene, camera);
   };
 
@@ -3378,6 +3890,7 @@ export function createMatchScene3D(
     if (width <= 0 || height <= 0) return;
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
+    renderer.setPixelRatio(baseDevicePixelRatio * currentRenderScale);
     renderer.setSize(width, height);
   };
 
@@ -3389,6 +3902,8 @@ export function createMatchScene3D(
     renderer,
     isSoftwareGl,
     updateTeamKits,
+    setTimeOfDay,
+    getPerformanceTelemetry,
     updateAndRender,
     resize,
     dispose,

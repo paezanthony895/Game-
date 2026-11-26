@@ -2,24 +2,43 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   PITCH,
+  EXPANDED_PITCH_SCALE,
+  getScaledPitchDimensions,
   PHYSICS_TUNING,
   createInitialBall,
   getCannonPhysicsWorld,
+  getPlayerColliderRadius,
+  resolvePlayerCollisions,
   stepBallPhysics,
   stepPlayerMovement,
+  EASTER_EGG_RACING_TITANS,
+  RACING_TITANS_CONFIG,
+  RACING_TITANS_AI_PROFILE,
+  isRacingTeam,
+  isRacingTitansActiveForTeam,
+  setRacingTitansMasterFlag,
   type MatchPlayerState,
 } from './physics';
+import {
+  UNITY_URP_SOURCE_FILES,
+  UNITY_EXTERNAL_ASSETS_MANIFEST,
+  UNITY_QUALITY_TIER_PROFILES,
+  UNITY_DELIVERABLE_STATUS_LIST,
+  UNITY_IMPORT_AND_APK_BUILD_STEPS,
+  buildUnityProjectBundleText,
+} from '../unity/unityUrpSuite';
 import { checkBallOutcome, evaluateAerialDuel, evaluateTackleOutcome, isPlayerOffside } from './rules';
 import {
   DIFFICULTY_CONFIG_TABLE,
   chooseAdaptiveTactic,
   computeGoalkeeperAI,
+  computeOffBallMovement,
   computeOutfieldCarrierDecision,
   evaluateTeamBrain,
   getDifficultyProfile,
   shouldExecuteFirstTouchShot,
 } from './ai';
-import { MAX_REPLAY_FRAMES, MatchEngine, type VARScenarioType } from './matchEngine';
+import { MAX_REPLAY_FRAMES, MatchEngine, type GoalKickAimState, type VARScenarioType } from './matchEngine';
 import {
   advanceCompetitionRound,
   computeLeagueStandings,
@@ -802,7 +821,7 @@ test('Goalkeeper takes goal kicks alone from 6-yard box while all 20 outfield pl
   engine.ball.z = 0.2;
   engine.step(1 / 60);
 
-  assert.equal(engine.phase, 'set_piece');
+  assert.equal(engine.phase, 'GOAL_KICK_AIM');
   const homeGk = engine.players.find((p) => p.side === 'home' && p.player.position === 'GK')!;
   assert.equal(engine.ball.ownerId, homeGk.id, 'Goal kick must be assigned exclusively to the Goalkeeper (GK)');
   assert.equal(engine.ball.x, 5.5, 'Goal kick ball must be spotted on the 6-yard line (x = 5.5m)');
@@ -949,14 +968,21 @@ test('Kickoff starts in ronda around center circle, goalkeeper ALWAYS kicks when
   engine.step(1 / 60);
 
   const homeGk = engine.players.find((p) => p.side === 'home' && p.player.position === 'GK')!;
-  assert.equal(engine.phase, 'set_piece');
+  assert.equal(engine.phase, 'GOAL_KICK_AIM');
   assert.equal(engine.restartType, 'goal_kick');
   assert.equal(engine.ball.ownerId, homeGk.id, 'Goalkeeper must ALWAYS take the goal kick when ball exits by his goal line after attacker touch');
 
-  // Step through the 0.7s set piece timer (42 frames) + 28 frames of ball flight and verify the Goalkeeper himself launches the ball upfield
-  for (let i = 0; i < 70; i++) {
+  // Verify user goalkeeper does NOT kick automatically after 120 frames (no timer), and kicks when releasing TIRO
+  for (let i = 0; i < 120; i++) {
     engine.step(1 / 60);
   }
+  assert.equal(engine.phase, 'GOAL_KICK_AIM', 'User goalkeeper must NEVER auto-kick on a timer during GOAL_KICK_AIM');
+  engine.userInput.shootPower = 0.85;
+  engine.userInput.shootReleased = true;
+  for (let i = 0; i < 30; i++) {
+    engine.step(1 / 60);
+  }
+  assert.equal(engine.phase, 'live');
   assert.equal(engine.ball.lastTouchPlayerId, homeGk.id, 'Goalkeeper must be the player who kicks the goal kick');
   assert.ok(engine.ball.x > 10, 'Goalkeeper goal kick must launch the ball toward midfield');
 
@@ -1412,4 +1438,485 @@ test('2026 Real Squads, PlayerAppearance (aspecto), World Cup stars, and cumulat
   assert.equal(lookedUp.rosterSource, 'curated');
   assert.equal(lookedUp.players[0].name, 'Estrella Real 2026');
 });
+
+test('Defensive line discipline prevents CBs from pushing into attack, anti-walk-in goal blocks dribbling into net, sharp turns loosen ball control, and online snapshots interpolate smoothly', () => {
+  const teams = getBaseDatabaseTeams();
+  const profile = getDifficultyProfile(6);
+
+  // 1. Verify Center Backs (CB) stay anchored in their defensive half (<= 43m) when team is attacking deep in final third (x = 85m)
+  const cbNode = {
+    id: 'h2',
+    team: 'home' as const,
+    role: 'DEF' as const,
+    specificPosition: 'CB',
+    x: 34,
+    y: 26,
+    vx: 0,
+    vy: 0,
+    baseX: 22,
+    baseY: 26,
+    stamina: 95,
+    hasBall: false,
+    overall: 85,
+    pace: 78,
+    shooting: 55,
+    passing: 76,
+    dribbling: 72,
+    defending: 87,
+    physical: 86,
+  };
+  const carrierNode = {
+    ...cbNode,
+    id: 'h10',
+    role: 'MID' as const,
+    specificPosition: 'CAM',
+    x: 85,
+    y: 34,
+    baseX: 68,
+    baseY: 34,
+    hasBall: true,
+  };
+  const brain = evaluateTeamBrain(
+    'home',
+    [cbNode, carrierNode],
+    [],
+    { x: 85, y: 34, vx: 3, vy: 0, ownerTeam: 'home', ownerId: 'h10' },
+    0,
+    50,
+    profile
+  );
+  assert.ok(
+    brain.defensiveLineX <= 43,
+    `Defensive line X when attacking must remain anchored <= 43m in own half (got ${brain.defensiveLineX.toFixed(1)}m)`
+  );
+  const cbMove = computeOffBallMovement(
+    cbNode,
+    [cbNode, carrierNode],
+    [],
+    { x: 85, y: 34, vx: 3, vy: 0, ownerTeam: 'home', ownerId: 'h10' },
+    profile,
+    'balanced',
+    brain
+  );
+  assert.ok(
+    cbMove.targetX <= 43,
+    `Center Back (CB) off-ball targetX must stay <= 43m to protect against counter-attacks (got ${cbMove.targetX.toFixed(1)}m)`
+  );
+
+  // 2. Verify sharp high-speed turn with the ball activates dribbleLooseTimer
+  const dribbler: MatchPlayerState = {
+    id: 'dribbler_test',
+    player: teams[0].players[9],
+    side: 'home',
+    slotIndex: 9,
+    x: 50,
+    y: 34,
+    vx: 7.2,
+    vy: 0,
+    facing: 0,
+    stamina: 95,
+    yellowCards: 0,
+    redCard: false,
+    injured: false,
+    tackleCooldown: 0,
+    stunTimer: 0,
+    slideTimer: 0,
+    kickAnimTimer: 0,
+    diveTimer: 0,
+    diveDirY: 0,
+    stridePhase: 0,
+  };
+  stepPlayerMovement(dribbler, -1, 0.2, true, true, 1 / 60, 'optimo', 1.24);
+  assert.ok(
+    (dribbler.dribbleLooseTimer ?? 0) > 0,
+    'Sharp high-speed turn while carrying the ball must trigger dribbleLooseTimer > 0'
+  );
+
+  // 3. Verify anti-walk-in goal rule: a player dribbling into the goal mouth without shooting cannot walk the ball across the goal line
+  const engine = new MatchEngine({
+    mode: 'quick_match',
+    homeTeam: teams[0],
+    awayTeam: teams[1],
+    userSide: 'home',
+    settings: DEFAULT_SETTINGS,
+  });
+  engine.phase = 'live';
+  const striker = engine.players.find((p) => p.side === 'home' && p.slotIndex === 9)!;
+  const awayGk = engine.players.find((p) => p.side === 'away' && p.player.position === 'GK')!;
+  // Move GK slightly away first to test goal-line dribble clamp, then test GK 1v1 smother
+  awayGk.x = 104.2;
+  awayGk.y = 44;
+  striker.x = 104.8;
+  striker.y = PITCH.HALF_Y;
+  striker.facing = 0;
+  engine.ball.ownerId = striker.id;
+  engine.ball.x = 104.9;
+  engine.ball.y = PITCH.HALF_Y;
+  engine.userInput.moveX = 1;
+  engine.userInput.moveY = 0;
+  engine.step(1 / 60);
+  assert.equal(engine.homeScore, 0, 'Player must NOT score a goal simply by walking/dribbling across the goal line without shooting');
+
+  // Place GK in 1v1 position in front of striker -> GK smothers the ball from striker's feet
+  awayGk.x = 103.5;
+  awayGk.y = PITCH.HALF_Y;
+  striker.x = 102.5;
+  striker.y = PITCH.HALF_Y;
+  engine.ball.ownerId = striker.id;
+  engine.ball.x = 102.9;
+  engine.ball.y = PITCH.HALF_Y;
+  engine.step(1 / 60);
+  assert.equal(engine.ball.ownerId, awayGk.id, 'Goalkeeper must smother and claim the ball when an attacker dribbles directly into 1v1 range without shooting');
+
+  // 4. Verify online multiplayer snapshot serialization & smooth interpolation
+  const snap = engine.serializeOnlineSnapshot();
+  assert.equal(typeof snap.matchMinute, 'number');
+  assert.equal(snap.players.length, 22);
+  engine.ball.x = 40;
+  engine.applyOnlineSnapshot(snap, 0.5);
+  assert.ok(engine.ball.x > 40, 'applyOnlineSnapshot must smoothly interpolate ball position toward snapshot state');
+});
+
+test('Unity 2022 LTS URP 80,000-spectator stadium, expanded 140x90m pitch scale factor, and all 5 Android engineering deliverables', () => {
+  // 1. Verify expanded 140 x 90 m pitch dimensions & configurable scale factor (140 / 105 = 1.3333334)
+  assert.equal(EXPANDED_PITCH_SCALE.TARGET_LENGTH_M, 140);
+  assert.equal(EXPANDED_PITCH_SCALE.TARGET_WIDTH_M, 90);
+  assert.equal(EXPANDED_PITCH_SCALE.STADIUM_CAPACITY, 80000);
+  assert.equal(EXPANDED_PITCH_SCALE.LIGHT_TOWER_COUNT, 6);
+  assert.ok(
+    Math.abs(EXPANDED_PITCH_SCALE.FACTOR - 140 / 105) < 0.0001,
+    'PITCH_SCALE_FACTOR must equal 140 / 105 (1.3333x)'
+  );
+  assert.equal(EXPANDED_PITCH_SCALE.PLAYER_SPEED_SCALE, EXPANDED_PITCH_SCALE.FACTOR);
+  assert.equal(EXPANDED_PITCH_SCALE.BALL_SPEED_SCALE, EXPANDED_PITCH_SCALE.FACTOR);
+  assert.equal(EXPANDED_PITCH_SCALE.CAMERA_SCALE, EXPANDED_PITCH_SCALE.FACTOR);
+
+  const dims = getScaledPitchDimensions();
+  assert.equal(dims.lengthM, 140);
+  assert.equal(dims.widthM, 90);
+  assert.equal(dims.penaltyAreaLengthM, 22);
+  assert.equal(dims.penaltyAreaWidthM, 53.36);
+  assert.equal(dims.sixYardLengthM, 7.33);
+  assert.equal(dims.sixYardWidthM, 24.25);
+  assert.equal(dims.centerCircleRadiusM, 12.2);
+  assert.equal(dims.penaltySpotDistanceM, 14.67);
+
+  // 2. Verify all 12 Unity 2022.3 LTS URP C# and HLSL source files are complete, real code (no pseudocode)
+  assert.equal(UNITY_URP_SOURCE_FILES.length, 12);
+  for (const file of UNITY_URP_SOURCE_FILES) {
+    assert.ok(file.code.length > 800, `Unity source file ${file.relativePath} must contain complete production implementation`);
+    assert.ok(!/TODO|PSEUDOCODE|FIXME/i.test(file.code), `Unity source file ${file.relativePath} must not contain placeholders`);
+  }
+
+  // 3. Verify external ASTC assets manifest respects max 2048px for stadium and 1024px for secondary elements
+  assert.ok(UNITY_EXTERNAL_ASSETS_MANIFEST.length >= 9);
+  for (const asset of UNITY_EXTERNAL_ASSETS_MANIFEST) {
+    assert.ok(asset.maxSizePx <= 2048, `Asset ${asset.name} exceeds 2048px limit`);
+    if (asset.type !== 'Static Mesh FBX') {
+      assert.ok(asset.androidFormat.includes('ASTC'), `Texture asset ${asset.name} must use ASTC compression on Android`);
+    }
+  }
+
+  // 4. Verify all 4 quality tiers (Baja, Media, Alta, Ultra) and bundle builder
+  assert.deepEqual(
+    UNITY_QUALITY_TIER_PROFILES.map((p) => p.tier),
+    ['Baja', 'Media', 'Alta', 'Ultra']
+  );
+  assert.ok(UNITY_DELIVERABLE_STATUS_LIST.length >= 7);
+  assert.ok(UNITY_IMPORT_AND_APK_BUILD_STEPS.unityImportSteps.length >= 5);
+  assert.ok(UNITY_IMPORT_AND_APK_BUILD_STEPS.androidApkBuildSteps.length >= 4);
+
+  const bundleText = buildUnityProjectBundleText();
+  assert.ok(bundleText.includes('PitchGrassSinglePlane') && bundleText.includes('DrawMeshInstancedIndirect'));
+});
+
+test('GOAL_KICK_AIM state: no auto-kick timer for user GK, freezes all players, left joystick aims, vertical slider adjusts height/power, TIRO charges/kicks, PASAR passes short to nearest aimed defender, and rival AI GK freezes user players until kick', () => {
+  const teams = getBaseDatabaseTeams();
+  const engine = new MatchEngine({
+    mode: 'quick_match',
+    homeTeam: teams[0],
+    awayTeam: teams[1],
+    userSide: 'home',
+    settings: DEFAULT_SETTINGS,
+  });
+
+  // 1. Trigger a user Goal Kick -> enters GOAL_KICK_AIM with no auto-kick timer
+  engine.phase = 'live';
+  engine.ball.ownerId = null;
+  engine.ball.lastTouchTeam = 'away';
+  engine.ball.x = -0.8;
+  engine.ball.y = 14;
+  engine.step(1 / 60);
+
+  const homeGk = engine.players.find((p) => p.side === 'home' && p.player.position === 'GK')!;
+  assert.equal(engine.phase, 'GOAL_KICK_AIM');
+  assert.ok(engine.goalKickAimState?.active);
+  assert.equal(engine.goalKickAimState?.isUserControlled, true);
+  assert.equal(engine.goalKickAimState?.keeperId, homeGk.id);
+  assert.equal(engine.ball.ownerId, homeGk.id);
+
+  // Snapshot all 21 non-keeper player positions and verify they stay 100% frozen across 300 frames (5 full seconds)
+  const initialPositions = new Map(
+    engine.players
+      .filter((p) => p.id !== homeGk.id)
+      .map((p) => [p.id, { x: p.x, y: p.y }])
+  );
+
+  for (let i = 0; i < 300; i++) {
+    engine.step(1 / 60);
+  }
+
+  assert.equal(engine.phase, 'GOAL_KICK_AIM', 'User GOAL_KICK_AIM must have NO timer that auto-kicks');
+  assert.equal(engine.ball.ownerId, homeGk.id, 'Ball cannot be contested while in GOAL_KICK_AIM');
+  for (const p of engine.players) {
+    assert.equal(p.vx, 0);
+    assert.equal(p.vy, 0);
+    assert.equal(p.animState, 'idle', `Player ${p.id} must have idle animation during GOAL_KICK_AIM`);
+    if (p.id !== homeGk.id) {
+      const snap = initialPositions.get(p.id)!;
+      assert.equal(p.x, snap.x, `Player ${p.id} X position must remain frozen during GOAL_KICK_AIM`);
+      assert.equal(p.y, snap.y, `Player ${p.id} Y position must remain frozen during GOAL_KICK_AIM`);
+    }
+  }
+
+  // 2. Left joystick horizontal direction steering & vertical height/power slider
+  engine.userInput.moveX = 0.8;
+  engine.userInput.moveY = 0;
+  for (let i = 0; i < 20; i++) {
+    engine.step(1 / 60);
+  }
+  engine.userInput.moveX = 0;
+  assert.ok(
+    (engine.goalKickAimState?.aimAngleRad ?? 0) > 0.3,
+    'Left joystick must steer the horizontal angle of the goal kick'
+  );
+
+  engine.setGoalKickElevationSlider(0.95);
+  assert.equal(engine.goalKickAimState?.elevationSlider, 0.95);
+
+  // 3. Holding TIRO charges power bar, and releasing TIRO executes the kick animation, launches ball with chosen direction/height/power, and immediately unfreezes all players
+  engine.userInput.shootHeld = true;
+  for (let i = 0; i < 25; i++) {
+    engine.step(1 / 60);
+  }
+  assert.equal(engine.goalKickAimState?.isChargingShoot, true);
+  assert.ok((engine.goalKickAimState?.chargePower ?? 0) > 0.5, 'Holding TIRO must charge goal kick power');
+
+  engine.userInput.shootHeld = false;
+  engine.userInput.shootReleased = true;
+  engine.step(1 / 60);
+
+  assert.equal(engine.phase, 'live', 'Releasing TIRO must immediately unfreeze the match to live phase');
+  assert.equal(engine.goalKickAimState, null);
+  assert.equal(homeGk.animState, 'shoot', 'Goalkeeper must execute kick animation on shoot release');
+  assert.ok(homeGk.kickAnimTimer > 0);
+  assert.equal(engine.ball.ownerId, null);
+  assert.ok(engine.ball.vx > 14, 'Long goal kick must launch ball forward with high velocity');
+  assert.ok(engine.ball.vy > 4, 'Angled goal kick must launch ball toward the aimed horizontal direction');
+  assert.ok(engine.ball.vz > 5, 'High elevation slider + charged TIRO must launch a high aerial ball (vz > 5)');
+
+  // 4. Goalkeeper holding ball in hands (enterGoalKickAim(homeGk, true)) + Botón PASAR executes short ground pass to nearest aimed defender
+  engine.enterGoalKickAim(homeGk, true);
+  assert.equal(engine.phase, 'GOAL_KICK_AIM');
+  const handsAim = engine.goalKickAimState as GoalKickAimState | null;
+  assert.equal(handsAim?.isFromHands, true);
+
+  // Aim toward the right defender (slotIndex 3 at y = PITCH.HALF_Y + 13.5)
+  if (handsAim) handsAim.aimAngleRad = 0.65;
+  engine.step(1 / 60);
+  const expectedDefender = engine.findNearestDefenderInAimDirection(homeGk, 0.65)!;
+  assert.ok(expectedDefender);
+
+  engine.userInput.passPressed = true;
+  engine.step(1 / 60);
+
+  assert.equal(engine.phase, 'live', 'Pressing PASAR must immediately unfreeze players and return to live play');
+  assert.equal(engine.goalKickAimState, null);
+  assert.equal(homeGk.animState, 'pass', 'Goalkeeper must execute pass animation on short pass');
+  assert.equal(engine.activeUserPlayerId, expectedDefender.id, 'Active control must switch to the targeted short-pass defender');
+  assert.ok(engine.ball.vz < 0.6, 'PASAR must execute a low ground pass (saque corto rasante)');
+
+  // 5. Rival AI Goalkeeper Goal Kick: freezes user players until AI goalkeeper kicks automatically
+  const awayGk = engine.players.find((p) => p.side === 'away' && p.player.position === 'GK')!;
+  engine.triggerSetPiece('goal_kick', 'away', PITCH.LENGTH - 5.5, PITCH.HALF_Y);
+  assert.equal(engine.phase, 'GOAL_KICK_AIM');
+  const aiAim = engine.goalKickAimState as GoalKickAimState | null;
+  assert.equal(aiAim?.isUserControlled, false);
+  assert.equal(aiAim?.keeperId, awayGk.id);
+
+  // Try moving user player while AI GK is preparing to kick -> user player must stay frozen!
+  const userPlayer = engine.players.find((p) => p.id === engine.activeUserPlayerId)!;
+  const frozenUserX = userPlayer.x;
+  const frozenUserY = userPlayer.y;
+  engine.userInput.moveX = 1;
+  engine.userInput.moveY = -1;
+  engine.userInput.sprint = true;
+  engine.step(1 / 60);
+  assert.equal(userPlayer.x, frozenUserX, 'User players must remain frozen while rival AI goalkeeper prepares goal kick');
+  assert.equal(userPlayer.y, frozenUserY);
+  assert.equal(userPlayer.vx, 0);
+  assert.equal(userPlayer.vy, 0);
+
+  // Step until AI goalkeeper executes automatic kick (~0.7s = 45 frames)
+  for (let i = 0; i < 50; i++) {
+    engine.step(1 / 60);
+  }
+  assert.equal(engine.phase, 'live', 'Rival AI goalkeeper must automatically kick after brief freeze and unfreeze match');
+  assert.equal(engine.ball.lastTouchPlayerId, awayGk.id);
+});
+
+test('EASTER_EGG_RACING_TITANS ("Racing Titanes") central flag, 3.5x scale & colliders, 100 attributes, zero fatigue/injury, unstoppable clashes/slide tackles, giant GK hitbox, Supreme AI, and seismic footsteps', () => {
+  assert.equal(EASTER_EGG_RACING_TITANS, true, 'Master flag EASTER_EGG_RACING_TITANS must exist and default to true');
+  assert.ok(
+    RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE >= 3 && RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE <= 4,
+    'TITAN_HEIGHT_SCALE must be between 3 and 4 times normal height'
+  );
+
+  const teams = getBaseDatabaseTeams();
+  const racingTeam = teams.find((t) => t.id === 'club_rac')!;
+  const riverTeam = teams.find((t) => t.id === 'club_riv') ?? teams[0];
+  assert.ok(racingTeam, 'Racing Club (club_rac) must exist in the database');
+  assert.equal(isRacingTeam(racingTeam), true);
+  assert.equal(isRacingTeam(riverTeam), false);
+
+  // 1. Not active when locked/disabled
+  const lockedSettings = {
+    ...DEFAULT_SETTINGS,
+    match: { ...DEFAULT_SETTINGS.match, racingTitansUnlocked: false, racingTitansEnabled: false },
+  };
+  assert.equal(isRacingTitansActiveForTeam(racingTeam, lockedSettings), false);
+
+  // 2. Active when unlocked and enabled in settings
+  const unlockedSettings = {
+    ...DEFAULT_SETTINGS,
+    match: { ...DEFAULT_SETTINGS.match, racingTitansUnlocked: true, racingTitansEnabled: true },
+  };
+  assert.equal(isRacingTitansActiveForTeam(racingTeam, unlockedSettings), true);
+  assert.equal(isRacingTitansActiveForTeam(riverTeam, unlockedSettings), false);
+
+  // 3. Master flag centralization: disabling master flag turns off Racing Titans completely
+  setRacingTitansMasterFlag(false);
+  assert.equal(isRacingTitansActiveForTeam(racingTeam, unlockedSettings), false);
+  setRacingTitansMasterFlag(true);
+  assert.equal(isRacingTitansActiveForTeam(racingTeam, unlockedSettings), true);
+
+  // 4. Spawn match with Racing Club (home) vs River Plate (away) with Racing Titans enabled
+  const soundsTriggered: string[] = [];
+  const engine = new MatchEngine({
+    mode: 'quick_match',
+    homeTeam: racingTeam,
+    awayTeam: riverTeam,
+    userSide: 'away', // Let AI control Racing Club to also verify Supreme AI + user rival
+    settings: unlockedSettings,
+    onSound: (s) => soundsTriggered.push(s),
+  });
+
+  assert.equal(engine.homeIsRacingTitans, true);
+  assert.equal(engine.awayIsRacingTitans, false);
+  assert.equal(engine.hasActiveRacingTitans, true);
+  assert.equal(engine.bannerText, '¡Racing Titanes activado!');
+  assert.ok(soundsTriggered.includes('titan_activation'), 'Must trigger titan_activation fanfare at kickoff');
+
+  const racingPlayers = engine.players.filter((p) => p.side === 'home');
+  const normalPlayers = engine.players.filter((p) => p.side === 'away');
+  assert.equal(racingPlayers.length, 11);
+
+  for (const rp of racingPlayers) {
+    assert.equal(rp.isRacingTitan, true);
+    assert.equal(rp.titanScale, RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE);
+    assert.equal(rp.player.overall, 100);
+    assert.equal(rp.stamina, 100);
+    assert.equal(rp.injured, false);
+    for (const [attrKey, attrVal] of Object.entries(rp.player.attributes)) {
+      assert.equal(attrVal, 100, `Racing Titan attribute ${attrKey} must be fixed at 100`);
+    }
+    assert.ok(
+      Math.abs(
+        getPlayerColliderRadius(rp) -
+          RACING_TITANS_CONFIG.NORMAL_COLLIDER_RADIUS_M * RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE
+      ) < 1e-6,
+      'Titan collider radius must scale proportionally with TITAN_HEIGHT_SCALE'
+    );
+  }
+
+  // 5. No fatigue, no injuries, and seismic footstep sound + camera shake when running
+  const titanRunner = racingPlayers.find((p) => p.player.position !== 'GK')!;
+  titanRunner.stamina = 42;
+  titanRunner.injured = true;
+  titanRunner.fallTimer = 0.8;
+  titanRunner.stunTimer = 0.8;
+  stepPlayerMovement(titanRunner, 1, 0, true, false, 0.25, 'optimo', 1.0);
+  assert.equal(titanRunner.stamina, 100, 'Racing Titans must never lose stamina');
+  assert.equal(titanRunner.injured, false, 'Racing Titans must never be injured');
+  assert.equal(titanRunner.fallTimer, 0, 'Racing Titans must never fall down');
+  assert.equal(titanRunner.stunTimer, 0, 'Racing Titans must never be stunned');
+
+  engine.phase = 'live';
+  titanRunner.vx = 7.5;
+  titanRunner.vy = 0;
+  engine.step(0.25);
+  assert.ok(
+    soundsTriggered.includes('titan_footstep'),
+    'Running Racing Titans must emit heavy titan_footstep sound'
+  );
+  assert.ok(engine.cameraShake > 0, 'Running Racing Titans must induce subtle camera vibration');
+
+  // 6. Unstoppable in body collisions & slide tackles against normal players
+  const normalDefender = normalPlayers.find((p) => p.player.position !== 'GK')!;
+  titanRunner.x = 52;
+  titanRunner.y = 34;
+  titanRunner.vx = 5;
+  titanRunner.vy = 0;
+  normalDefender.x = 52.8;
+  normalDefender.y = 34;
+  normalDefender.vx = -3;
+  normalDefender.vy = 0;
+  engine.ball.ownerId = titanRunner.id;
+
+  const normalBeforeX = normalDefender.x;
+  const colRes = resolvePlayerCollisions([titanRunner, normalDefender], engine.ball.ownerId);
+  assert.notEqual(
+    colRes.dispossessedCarrierId,
+    titanRunner.id,
+    'Unstoppable Racing Titan must never lose the ball in a body collision against a normal player'
+  );
+  assert.ok(
+    normalDefender.x > normalBeforeX + 0.5 && normalDefender.vx > 0,
+    'Normal rival must be pushed away on contact with a Racing Titan'
+  );
+
+  // Slide tackle by normal defender against Racing Titan carrier
+  const slideOutcome = evaluateTackleOutcome(normalDefender, titanRunner, true, () => 0.5);
+  assert.equal(slideOutcome.wonBall, false, 'Normal player slide tackle must never win ball from Racing Titan');
+  assert.equal(slideOutcome.knockdown, false, 'Normal player slide tackle must never knock down a Racing Titan');
+  assert.equal(slideOutcome.injuryTriggered, false, 'Racing Titan must never be injured by a slide tackle');
+
+  // 7. Supreme AI profile check
+  assert.equal(RACING_TITANS_AI_PROFILE.reactionDelaySec, 0.015);
+  assert.equal(RACING_TITANS_AI_PROFILE.passErrorMeters, 0);
+  assert.equal(RACING_TITANS_AI_PROFILE.shotErrorMeters, 0);
+  assert.equal(RACING_TITANS_AI_PROFILE.gkReflexes, 1.0);
+
+  // 8. Giant Goalkeeper Hitbox covers almost the entire goal
+  const titanGk = racingPlayers.find((p) => p.player.position === 'GK')!;
+  titanGk.x = 1.2;
+  titanGk.y = PITCH.HALF_Y;
+  titanGk.diveTimer = 0;
+  engine.ball.ownerId = null;
+  engine.ball.lastTouchTeam = 'away';
+  engine.ball.lastTouchPlayerId = normalDefender.id;
+  engine.ball.x = 1.4;
+  engine.ball.y = PITCH.HALF_Y + 3.4; // 3.4m lateral (near goal post, beyond normal GK reach without dive, within Titan 4.55m reach)
+  engine.ball.z = 2.25; // High top-corner height (within Titan 3.75m vertical reach)
+  engine.ball.vx = -22;
+  engine.ball.vy = 0;
+  engine.ball.vz = 0;
+
+  engine.step(1 / 60);
+  assert.ok(
+    engine.homeStats.saves >= 1 || (engine.ball.lastTouchTeam as string) === 'home',
+    'Giant Racing Titan goalkeeper hitbox must cover almost the entire goal and save top-corner shots'
+  );
+});
+
 

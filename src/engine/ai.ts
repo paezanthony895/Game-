@@ -223,6 +223,7 @@ export interface AIPlayerNode {
   dribbling: number;
   defending: number;
   physical: number;
+  specificPosition?: string;
   aiState?: AIPlayerState;
 }
 
@@ -333,12 +334,18 @@ export function evaluateTeamBrain(
     profile.tacticalDiscipline > 0.72;
   const trapStepUp = offsideTrapActive ? 4.2 : 0;
 
-  // Altura de la línea defensiva en metros (en dificultad máxima asfixia la salida del área rival)
-  const highPressPush = profile.level >= 8 ? 16 : profile.level >= 7 ? 10 : 0;
-  const baseLineAdvance = 22 + highPressPush + ballProgress * 38 + urgencyBonus * 14 + trapStepUp;
+  // Altura de la línea defensiva en metros:
+  // Cuando el equipo ATACA, la línea defensiva (centrales y lateral de cierre) MANTIENE su zona en campo propio
+  // (máximo ~42m desde su propio arco) para evitar quedar desprotegido ante contraataques.
+  const highPressPush =
+    ball.ownerTeam === team ? 0 : profile.level >= 8 ? 16 : profile.level >= 7 ? 10 : 0;
+  const rawLineAdvance =
+    ball.ownerTeam === team
+      ? Math.min(42, 18 + ballProgress * 20 + Math.max(0, urgencyBonus * 6))
+      : 20 + highPressPush + ballProgress * 34 + urgencyBonus * 12 + trapStepUp;
   const defensiveLineX = Math.max(
     14,
-    Math.min(PITCH_W - 14, ownGoalX + dir * baseLineAdvance)
+    Math.min(PITCH_W - 14, ownGoalX + dir * rawLineAdvance)
   );
 
   // Receptor designado cuando el balón está en vuelo / suelto (pase en curso o rebote)
@@ -587,10 +594,15 @@ export function computeOutfieldCarrierDecision(
     const rivalGK = opponents.find((o) => o.role === 'GK');
     const gkY = rivalGK ? rivalGK.y : goalCenterY;
 
-    // Apuntar al ángulo más lejano respecto al arquero dentro del arco de 9.8m (99%+ precisión en dificultad máxima)
+    // Apuntar al ángulo más lejano respecto al arquero dentro del arco de 9.8m (99%+ precisión en dificultad máxima, 100% en Racing Titanes)
+    const isSupremeTitanAI = profile.shotErrorMeters === 0 && profile.passErrorMeters === 0;
     const cornerOffset = Math.max(3.35, PITCH.GOAL_HALF - 0.55);
     const aimCornerY = gkY >= goalCenterY ? goalCenterY - cornerOffset : goalCenterY + cornerOffset;
-    const errorY = profile.level >= 8 ? (Math.random() - 0.5) * 0.08 : (Math.random() - 0.5) * profile.shotErrorMeters;
+    const errorY = isSupremeTitanAI
+      ? 0
+      : profile.level >= 8
+      ? (Math.random() - 0.5) * 0.08
+      : (Math.random() - 0.5) * profile.shotErrorMeters;
     const rawTargetY = aimCornerY + errorY;
     const safePostLimit = PITCH.GOAL_HALF - (profile.level >= 7 ? 0.36 : 0.12);
     const finalTargetY =
@@ -611,7 +623,8 @@ export function computeOutfieldCarrierDecision(
     const distScore = (maxShootDist + 0.5 - distToGoal) * 4.4;
     const angleScore = Math.max(0, 18 - angleOffset * 0.65);
     const statBonus = (carrier.shooting - 70) * 0.48;
-    const aggressionBonus = profile.offensiveAggression * 24 + (profile.level >= 7 ? 32 : 0);
+    const aggressionBonus =
+      profile.offensiveAggression * 24 + (profile.level >= 7 ? 32 : 0) + (isSupremeTitanAI ? 18 : 0);
     const blockPenalty = shotBlockRisk * (profile.level >= 7 ? 20 : 34);
 
     const shootUtility = 52 + distScore + angleScore + statBonus + aggressionBonus - blockPenalty;
@@ -954,36 +967,71 @@ export function computeOffBallMovement(
   // ==========================================================================
   if (teamHasBall) {
     const ballProgress = dir === 1 ? ball.x / PITCH_W : (PITCH_W - ball.x) / PITCH_W;
-    const dynamicShiftX = (ball.x - PITCH_W / 2) * 0.52 + tacticShiftX + dir * activeBrain.urgencyBonus * 14;
-    const lateralShiftY = (ball.y - goalCenterY) * 0.24;
+    const dynamicShiftX = (ball.x - PITCH_W / 2) * 0.48 + tacticShiftX + dir * activeBrain.urgencyBonus * 10;
+    const lateralShiftY = (ball.y - goalCenterY) * 0.22;
 
     let targetX = player.baseX + dynamicShiftX;
     let targetY = player.baseY + lateralShiftY;
     let sprint = false;
 
-    // 1) Corredor de pared / desmarque diagonal (Give-and-Go)
-    if (activeBrain.giveAndGoRunnerId === player.id) {
-      targetX = Math.max(8, Math.min(PITCH_W - 8, ball.x + dir * 16));
-      // Desmarque en diagonal rompiendo hacia el espacio entre centrales
+    const specPos = player.specificPosition || player.role;
+    const isCentralDefender =
+      specPos === 'CB' || (player.role === 'DEF' && player.baseY >= 17.5 && player.baseY <= PITCH_H - 17.5);
+    const isFullback =
+      specPos === 'LB' ||
+      specPos === 'RB' ||
+      (player.role === 'DEF' && (player.baseY < 17.5 || player.baseY > PITCH_H - 17.5));
+    const isHoldingMid = specPos === 'CDM';
+
+    // 1) Defensores centrales (CB): NUNCA suben todos al ataque; mantienen línea de resguardo (rest-defense) en campo propio
+    if (isCentralDefender) {
+      const maxCbAdvanceX = ownGoalX + dir * Math.min(43, 18 + ballProgress * 21);
+      targetX =
+        dir === 1
+          ? Math.min(activeBrain.defensiveLineX, maxCbAdvanceX)
+          : Math.max(activeBrain.defensiveLineX, maxCbAdvanceX);
+      // Basculación lateral suave para cubrir la zona central frente a posibles contraataques
+      targetY = goalCenterY + (player.baseY - goalCenterY) * 0.84 + (ball.y - goalCenterY) * 0.16;
+      sprint = Math.hypot(targetX - player.x, targetY - player.y) > 9.5;
+    }
+    // 1b) Laterales (LB / RB): solo UNO (el del costado del balón) puede proyectarse al ataque; el otro cierra atrás
+    else if (isFullback) {
+      if (activeBrain.overlapFullbackId === player.id && ballProgress > 0.30) {
+        targetX = Math.max(10, Math.min(PITCH_W - 10, ball.x + dir * 13.5));
+        targetY = player.baseY < goalCenterY ? 5.2 : PITCH_H - 5.2;
+        sprint = true;
+      } else {
+        // Lateral del lado opuesto se queda en equilibrio defensivo cerrando hacia adentro
+        const restDefX = ownGoalX + dir * Math.min(45, 21 + ballProgress * 20);
+        targetX = restDefX;
+        targetY = goalCenterY + (player.baseY - goalCenterY) * 0.72 + (ball.y - goalCenterY) * 0.14;
+        sprint = Math.hypot(targetX - player.x, targetY - player.y) > 10;
+      }
+    }
+    // 1c) Mediocampista de contención (CDM): equilibrio táctico por delante de los centrales y opción de pase seguro atrás
+    else if (isHoldingMid) {
+      const cdmAnchorX = activeBrain.defensiveLineX + dir * 10.5;
+      const maxCdmX = ownGoalX + dir * 56;
+      targetX = dir === 1 ? Math.min(cdmAnchorX, maxCdmX) : Math.max(cdmAnchorX, maxCdmX);
+      targetY = goalCenterY + (player.baseY - goalCenterY) * 0.75 + (ball.y - goalCenterY) * 0.25;
+      sprint = Math.hypot(targetX - player.x, targetY - player.y) > 11;
+    }
+    // 2) Corredor de pared / desmarque diagonal (Give-and-Go) para mediocampistas ofensivos o delanteros
+    else if (activeBrain.giveAndGoRunnerId === player.id) {
+      targetX = Math.max(8, Math.min(PITCH_W - 8, ball.x + dir * 15.5));
       const pullToCenter = (goalCenterY - player.y) * 0.38;
       targetY = Math.max(8, Math.min(PITCH_H - 8, player.y + pullToCenter));
       sprint = true;
     }
-    // 1b) Tercer hombre (Third-man vertical run) rompiendo desde segunda línea por el carril interior
+    // 2b) Tercer hombre (Third-man vertical run) rompiendo desde segunda línea por el carril interior
     else if (activeBrain.thirdManRunnerId === player.id) {
-      targetX = Math.max(8, Math.min(PITCH_W - 8, ball.x + dir * 14));
-      const halfSpaceY = player.baseY < goalCenterY ? goalCenterY - 10.5 : goalCenterY + 10.5;
+      targetX = Math.max(8, Math.min(PITCH_W - 8, ball.x + dir * 13.5));
+      const halfSpaceY = player.baseY < goalCenterY ? goalCenterY - 11.5 : goalCenterY + 11.5;
       targetY = halfSpaceY;
       sprint = true;
     }
-    // 1c) Lateral doblando por banda a máxima velocidad (Overlapping Fullback)
-    else if (activeBrain.overlapFullbackId === player.id) {
-      targetX = Math.max(8, Math.min(PITCH_W - 8, ball.x + dir * 15));
-      targetY = player.baseY < goalCenterY ? 5.5 : PITCH_H - 5.5;
-      sprint = true;
-    }
-    // 2) Delanteros atacan la espalda de la última línea defensiva rival (sin caer en offside grosero)
-    else if (player.role === 'FWD') {
+    // 3) Delanteros y extremos (ST / LW / RW / FWD) atacan espacios libres y buscan posición de remate sin quedar en offside
+    else if (player.role === 'FWD' || specPos === 'LW' || specPos === 'RW' || specPos === 'ST') {
       const enemyDefs = opponents.filter((o) => o.role !== 'GK');
       let lastDefX = enemyGoalX - dir * 18;
       if (enemyDefs.length > 0) {
@@ -993,20 +1041,39 @@ export function computeOffBallMovement(
             : Math.min(...enemyDefs.map((o) => o.x));
       }
 
-      const offsideSafeLineX = dir === 1 ? Math.max(ball.x, lastDefX - 1.2) : Math.min(ball.x, lastDefX + 1.2);
+      const offsideSafeLineX = dir === 1 ? Math.max(ball.x + 2, lastDefX - 1.1) : Math.min(ball.x - 2, lastDefX + 1.1);
       targetX = dir === 1 ? Math.min(PITCH_W - 6, offsideSafeLineX) : Math.max(6, offsideSafeLineX);
 
-      // Si el balón va por banda, atacar primer o segundo palo
-      if (ballProgress > 0.65 && (ball.y < 16 || ball.y > PITCH_H - 16)) {
-        targetX = enemyGoalX - dir * 9.5;
-        targetY = player.baseY < goalCenterY ? goalCenterY - 4.5 : goalCenterY + 4.5;
+      if (specPos === 'LW' || specPos === 'RW') {
+        // Extremos abren la cancha en construcción y trazan diagonal al área en último tercio
+        const wideY = player.baseY < goalCenterY ? 7.5 : PITCH_H - 7.5;
+        const cutInY = player.baseY < goalCenterY ? goalCenterY - 8.5 : goalCenterY + 8.5;
+        targetY = ballProgress > 0.64 ? cutInY : wideY;
+      } else if (ballProgress > 0.62 && (ball.y < 18 || ball.y > PITCH_H - 18)) {
+        // Centrodelantero ataca zona de penal / primer y segundo palo en centros
+        targetX = enemyGoalX - dir * 10.2;
+        targetY = player.baseY < goalCenterY ? goalCenterY - 4.2 : goalCenterY + 4.2;
+      } else {
+        // Desmarque lateral lejos del central más cercano
+        let nearestDef: AIPlayerNode | null = null;
+        let minDefD = Infinity;
+        for (const opp of enemyDefs) {
+          const d = Math.hypot(opp.x - targetX, opp.y - targetY);
+          if (d < minDefD) {
+            minDefD = d;
+            nearestDef = opp;
+          }
+        }
+        if (nearestDef && minDefD < 5.5) {
+          targetY += targetY <= nearestDef.y ? -3.8 : 3.8;
+        }
       }
-      sprint = ballProgress > 0.42;
+      sprint = ballProgress > 0.36;
     }
-    // 3) Mediocampistas ofrecen línea de pase clara en triángulos de apoyo alejándose de su marcador
-    else if (player.role === 'MID') {
-      targetX = player.baseX + dynamicShiftX + dir * (ballProgress > 0.52 ? 9 : 3.5);
-      // Buscar bolsillo de espacio lejos del rival más cercano
+    // 4) Mediocampistas interiores y enganches (CM / CAM / MID) ofrecen líneas de pase claras en triángulos de apoyo
+    else {
+      const supportAdvance = specPos === 'CAM' ? 11.5 : ballProgress > 0.52 ? 8.5 : 3.5;
+      targetX = player.baseX + dynamicShiftX + dir * supportAdvance;
       let nearestOpp: AIPlayerNode | null = null;
       let minD = Infinity;
       for (const opp of opponents) {
@@ -1016,23 +1083,29 @@ export function computeOffBallMovement(
           nearestOpp = opp;
         }
       }
-      if (nearestOpp && minD < 6.8) {
+      if (nearestOpp && minD < 7.2) {
         const pushX = targetX - nearestOpp.x;
         const pushY = targetY - nearestOpp.y;
         const len = Math.hypot(pushX, pushY) || 1;
-        targetX += (pushX / len) * 4.5;
-        targetY += (pushY / len) * 4.5;
+        targetX += (pushX / len) * 4.8;
+        targetY += (pushY / len) * 4.8;
       }
-      sprint = activeBrain.phase === 'COUNTER_ATTACK' || ballProgress > 0.65;
+      sprint = activeBrain.phase === 'COUNTER_ATTACK' || ballProgress > 0.62;
     }
-    // 4) Defensores acompañan en bloque manteniendo equilibrio
-    else if (player.role === 'DEF') {
-      targetX = activeBrain.defensiveLineX;
-      // Laterales suben por banda si están del lado del balón
-      const isFullback = player.baseY < 18 || player.baseY > PITCH_H - 18;
-      if (isFullback && Math.abs(player.baseY - ball.y) < 24 && ballProgress > 0.42) {
-        targetX += dir * 13;
-        sprint = true;
+
+    // 5) Separación anti-amontonamiento (evitar que varios compañeros corran al mismo punto o encimen al portador)
+    const minTeammateSpacing = 6.8;
+    for (const mate of teammates) {
+      if (mate.id === player.id || mate.role === 'GK') continue;
+      const refX = mate.hasBall ? mate.x : (mate.x + mate.baseX) * 0.5;
+      const refY = mate.hasBall ? mate.y : (mate.y + mate.baseY) * 0.5;
+      const dx = targetX - refX;
+      const dy = targetY - refY;
+      const dist = Math.hypot(dx, dy);
+      if (dist < minTeammateSpacing && dist > 0.01) {
+        const push = (minTeammateSpacing - dist) * 0.72;
+        targetX += (dx / dist) * push;
+        targetY += (dy / dist) * push;
       }
     }
 
@@ -1155,7 +1228,7 @@ export function computeOffBallMovement(
     };
   }
 
-  // 4) ESTADO 'COVERING_SPACE': Basculación zonal en bloque compacto
+  // 4) ESTADO 'COVERING_SPACE': Basculación zonal en bloque compacto y cobertura si otro defensor salió a presionar
   const blockX =
     player.role === 'DEF'
       ? activeBrain.defensiveLineX
@@ -1163,17 +1236,28 @@ export function computeOffBallMovement(
       ? activeBrain.defensiveLineX + dir * 13.5
       : activeBrain.defensiveLineX + dir * 27;
 
-  const compressedY =
+  let compressedY =
     goalCenterY +
     (player.baseY - goalCenterY) * activeBrain.compactnessY +
     (ball.y - goalCenterY) * 0.28;
+
+  // Si un compañero defensor salió a presionar al portador, los defensores adyacentes cierran su hueco (cobertura defensiva)
+  if (player.role === 'DEF' && activeBrain.primaryPresserId) {
+    const presser = teammates.find((t) => t.id === activeBrain.primaryPresserId);
+    if (presser && presser.role === 'DEF' && presser.id !== player.id) {
+      const gapY = presser.baseY - player.baseY;
+      if (Math.abs(gapY) < 26) {
+        compressedY += gapY * 0.32;
+      }
+    }
+  }
 
   const distToCover = Math.hypot(blockX - player.x, compressedY - player.y);
 
   return {
     targetX: Math.max(5, Math.min(PITCH_W - 5, blockX)),
     targetY: Math.max(5, Math.min(PITCH_H - 5, compressedY)),
-    sprint: distToCover > 10,
+    sprint: distToCover > 9,
     desiredState: 'COVERING_SPACE',
   };
 }
@@ -1204,32 +1288,32 @@ export function computeGoalkeeperAI(
   const distBallToGoal = Math.hypot(ball.x - goalX, ball.y - goalCenterY);
   const ballHeadingToGoal =
     isHome
-      ? ball.vx < -14.0 || (ball.vx < -7.5 && distBallToGoal < 10.5)
-      : ball.vx > 14.0 || (ball.vx > 7.5 && distBallToGoal < 10.5);
+      ? ball.vx < -13.0 || (ball.vx < -6.8 && distBallToGoal < 11.5)
+      : ball.vx > 13.0 || (ball.vx > 6.8 && distBallToGoal < 11.5);
 
   // 1) Reacción predictiva a disparo franco hacia el arco amplio (incluyendo efecto curva Magnus)
-  if (ballHeadingToGoal && distBallToGoal < 32) {
+  if (ballHeadingToGoal && distBallToGoal < 34) {
     const timeToGoalLine = Math.abs((goalX - ball.x) / (ball.vx || 1));
-    if (timeToGoalLine > 0 && timeToGoalLine < 1.55) {
+    if (timeToGoalLine > 0 && timeToGoalLine < 1.6) {
       const spinCurveOffset = (ball.spin ?? 0) * 0.42 * timeToGoalLine * timeToGoalLine;
       const predictedY = ball.y + ball.vy * timeToGoalLine + spinCurveOffset;
-      if (Math.abs(predictedY - goalCenterY) < halfGoal + 1.4) {
-        const reflexError = (1 - profile.gkReflexes) * (Math.random() - 0.5) * 1.65;
+      if (Math.abs(predictedY - goalCenterY) < halfGoal + 1.5) {
+        const reflexError = (1 - profile.gkReflexes) * (Math.random() - 0.5) * 1.45;
         const diveY = Math.max(
-          goalCenterY - (halfGoal - 0.15),
-          Math.min(goalCenterY + (halfGoal - 0.15), predictedY + reflexError)
+          goalCenterY - (halfGoal - 0.12),
+          Math.min(goalCenterY + (halfGoal - 0.12), predictedY + reflexError)
         );
         const deltaY = diveY - gk.y;
         const diveDirection =
           Math.abs(deltaY) < 0.48 ? 'center' : deltaY < 0 ? 'left' : 'right';
         // Velocidad lateral explosiva de estirada para cubrir todo el ancho del arco de 9.8m
         const requiredDiveSpeed = Math.min(
-          11.2,
-          Math.max(6.8, Math.abs(deltaY) / Math.max(0.22, timeToGoalLine * 0.85))
-        ) * (0.82 + profile.gkReflexes * 0.24);
+          11.6,
+          Math.max(7.2, Math.abs(deltaY) / Math.max(0.20, timeToGoalLine * 0.82))
+        ) * (0.85 + profile.gkReflexes * 0.22);
 
         return {
-          targetX: goalX + dir * 0.45,
+          targetX: goalX + dir * 0.55,
           targetY: diveY,
           sprint: true,
           diveDirection,
@@ -1241,8 +1325,8 @@ export function computeGoalkeeperAI(
   }
 
   // 2) Portero Líbero (Sweeper-Keeper): salir a cortar balones filtrados o sueltos dentro o al borde del área
-  if (!ball.ownerId && distBallToGoal < 21.5) {
-    const ballMovingTowardBox = isHome ? ball.vx <= 2.5 : ball.vx >= -2.5;
+  if (!ball.ownerId && distBallToGoal < 22.0) {
+    const ballMovingTowardBox = isHome ? ball.vx <= 2.8 : ball.vx >= -2.8;
     if (ballMovingTowardBox) {
       const gkIntercept = computeBallInterceptPoint({ x: gk.x, y: gk.y, pace: 88 }, ball);
       const gkDist = Math.hypot(gkIntercept.x - gk.x, gkIntercept.y - gk.y);
@@ -1253,7 +1337,7 @@ export function computeGoalkeeperAI(
       }
       // Si el arquero llega antes o al mismo tiempo que el delantero, o es un centro aéreo al área chica
       const isAerialCrossInBox = ball.z > 0.9 && distBallToGoal < 12.5;
-      if (gkDist <= nearestAttackerDist * (0.95 + profile.gkReflexes * 0.18) || isAerialCrossInBox) {
+      if (gkDist <= nearestAttackerDist * (0.98 + profile.gkReflexes * 0.18) || isAerialCrossInBox) {
         return {
           targetX: gkIntercept.x,
           targetY: gkIntercept.y,
@@ -1265,18 +1349,18 @@ export function computeGoalkeeperAI(
     }
   }
 
-  // 3) Salida agresiva a achicar el ángulo en mano a mano (1v1) cuando el delantero entra al área
-  if (distBallToGoal < 16.5 && ball.ownerTeam !== gk.team) {
-    const rushFactor = 0.42 + profile.gkReflexes * 0.44;
+  // 3) Salida agresiva a achicar el ángulo en mano a mano (1v1) cuando el delantero entra al área con balón
+  if (distBallToGoal < 17.5 && ball.ownerTeam !== gk.team) {
+    const rushFactor = 0.48 + profile.gkReflexes * 0.44;
     const rushX = goalX + (ball.x - goalX) * rushFactor;
-    const rushY = goalCenterY + (ball.y - goalCenterY) * 0.64;
+    const rushY = goalCenterY + (ball.y - goalCenterY) * 0.68;
     const maxCoverY = halfGoal + 1.2;
     return {
       targetX: rushX,
       targetY: Math.max(goalCenterY - maxCoverY, Math.min(goalCenterY + maxCoverY, rushY)),
       sprint: true,
       diveDirection: 'none',
-      claimBall: distBallToGoal < 5.2,
+      claimBall: distBallToGoal < 6.5,
     };
   }
 
@@ -1290,7 +1374,7 @@ export function computeGoalkeeperAI(
   return {
     targetX,
     targetY,
-    sprint: Math.hypot(targetX - gk.x, targetY - gk.y) > 1.35,
+    sprint: Math.hypot(targetX - gk.x, targetY - gk.y) > 1.25,
     diveDirection: 'none',
     claimBall: false,
   };

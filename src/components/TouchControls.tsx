@@ -78,10 +78,16 @@ export const TouchControls: React.FC<TouchControlsProps> = ({
     setKnobOffset({ x: kx, y: ky });
 
     const norm = clamped / maxR;
-    if (norm < 0.12) {
+    const DEAD_ZONE = 0.08;
+    if (norm < DEAD_ZONE) {
       callbacks.onMove(0, 0, false);
     } else {
-      callbacks.onMove(Math.cos(angle) * norm, Math.sin(angle) * norm, norm > 0.88);
+      const smoothMag = Math.min(1, (norm - DEAD_ZONE) / (1 - DEAD_ZONE));
+      callbacks.onMove(
+        Math.cos(angle) * smoothMag,
+        Math.sin(angle) * smoothMag,
+        smoothMag > 0.86
+      );
     }
   };
 

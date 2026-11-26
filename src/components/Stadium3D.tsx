@@ -130,6 +130,7 @@ export const Stadium3DFiberCanvas: React.FC<{
 export interface Stadium3DProps {
   engineRef: React.MutableRefObject<MatchEngine | null>;
   pausedRef: React.MutableRefObject<boolean>;
+  sceneControllerOutRef?: React.MutableRefObject<MatchScene3DController | null>;
   homeTeam: Team;
   awayTeam: Team;
   homeKit: KitSelection;
@@ -148,13 +149,14 @@ export interface Stadium3DProps {
 /**
  * Stadium3D Component
  * Replaces the 2D canvas render in MatchCanvas with a full Three.js + React Three Fiber
- * 3D Stadium & 1050x600 Pitch scene, ambient & floodlight stadium illumination,
+ * 3D Stadium & 140x90m expanded playable pitch, Day/Afternoon/Night live lighting switcher,
  * lateral TV broadcast cameras, and software-WebGL pacing support while preserving
  * all match state and touch controls.
  */
 export const Stadium3D: React.FC<Stadium3DProps> = ({
   engineRef,
   pausedRef,
+  sceneControllerOutRef,
   homeTeam,
   awayTeam,
   homeKit,
@@ -192,6 +194,15 @@ export const Stadium3D: React.FC<Stadium3DProps> = ({
     }
   }, [homeTeam, awayTeam, homeKit, awayKit]);
 
+  // Dynamically switch Day / Afternoon / Night lightmaps & skybox without reloading scene
+  const prevTimeOfDayRef = useRef<GameSettings['match']['timeOfDay']>(settings.match.timeOfDay);
+  useEffect(() => {
+    if (prevTimeOfDayRef.current !== settings.match.timeOfDay) {
+      prevTimeOfDayRef.current = settings.match.timeOfDay;
+      sceneControllerRef.current?.setTimeOfDay(settings.match.timeOfDay);
+    }
+  }, [settings.match.timeOfDay]);
+
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
@@ -206,6 +217,9 @@ export const Stadium3D: React.FC<Stadium3DProps> = ({
       equippedOptions
     );
     sceneControllerRef.current = controller;
+    if (sceneControllerOutRef) {
+      sceneControllerOutRef.current = controller;
+    }
 
     const updateSize = () => {
       const w = mount.clientWidth || window.innerWidth;

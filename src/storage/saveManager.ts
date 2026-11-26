@@ -174,6 +174,8 @@ export const DEFAULT_SETTINGS: GameSettings = {
     weather: 'despejado',
     timeOfDay: 'noche',
     pitchCondition: 'optimo',
+    racingTitansUnlocked: false,
+    racingTitansEnabled: false,
   },
   visual: {
     quality: 'alta',
@@ -491,8 +493,27 @@ export function recordMatchIntoSave(state: SaveState, summary: MatchResultSummar
     };
   });
 
+  const userTeamId = summary.userSide === 'home' ? summary.homeTeamId : summary.awayTeamId;
+  const userTeamName = (summary.userSide === 'home' ? summary.homeTeamName : summary.awayTeamName).toLowerCase();
+  const wonWithRacing =
+    userWon &&
+    (userTeamId === 'club_rac' ||
+      userTeamId === 'rac' ||
+      userTeamName.includes('racing club') ||
+      userTeamName === 'racing');
+
   return {
     ...state,
+    settings: wonWithRacing
+      ? {
+          ...state.settings,
+          match: {
+            ...state.settings.match,
+            racingTitansUnlocked: true,
+            racingTitansEnabled: true,
+          },
+        }
+      : state.settings,
     stats,
     achievements,
     survivalStreak,

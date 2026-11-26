@@ -1,5 +1,26 @@
 import * as CANNON from 'cannon-es';
 import type { PitchCondition, Player, WeatherType } from '../types/football';
+import {
+  EASTER_EGG_RACING_TITANS,
+  RACING_TITANS_AI_PROFILE,
+  RACING_TITANS_CONFIG,
+  isRacingTeam,
+  isRacingTitansActiveForTeam,
+  isRacingTitansMasterFlagEnabled,
+  setRacingTitansMasterFlag,
+  upgradePlayerToRacingTitan,
+} from './racingTitansEasterEgg';
+
+export {
+  EASTER_EGG_RACING_TITANS,
+  RACING_TITANS_AI_PROFILE,
+  RACING_TITANS_CONFIG,
+  isRacingTeam,
+  isRacingTitansActiveForTeam,
+  isRacingTitansMasterFlagEnabled,
+  setRacingTitansMasterFlag,
+  upgradePlayerToRacingTitan,
+};
 
 export const PITCH = {
   LENGTH: 105,
@@ -33,6 +54,68 @@ export const PHYSICS_TUNING = {
   SHOT_SPEED_MAX_MPS: 33.0,
   GRAVITY_MPS2: 14.8,
 } as const;
+
+/**
+ * Configurable Expanded Stadium & Pitch Scale (140 x 90 m playable surface)
+ * Scales pitch geometry, markings, player speeds, ball velocities, and camera distances proportionally
+ * so match pacing feels fast and natural across the larger 140x90m arena.
+ */
+export const EXPANDED_PITCH_SCALE = {
+  TARGET_LENGTH_M: 140,
+  TARGET_WIDTH_M: 90,
+  FACTOR: 140 / 105, // 1.3333333333333333 configurable master scale factor
+  FACTOR_X: 140 / 105, // 105m -> 140m (1.3333x)
+  FACTOR_Y: 90 / 68, // 68m -> 90m (1.3235x)
+  PLAYER_SPEED_SCALE: 140 / 105,
+  BALL_SPEED_SCALE: 140 / 105,
+  CAMERA_SCALE: 140 / 105,
+  STADIUM_CAPACITY: 80000,
+  LIGHT_TOWER_COUNT: 6,
+} as const;
+
+export interface ScaledPitchDimensions {
+  scaleFactor: number;
+  lengthM: number;
+  widthM: number;
+  penaltyAreaLengthM: number;
+  penaltyAreaWidthM: number;
+  sixYardLengthM: number;
+  sixYardWidthM: number;
+  centerCircleRadiusM: number;
+  penaltySpotDistanceM: number;
+  goalWidthM: number;
+  goalHeightM: number;
+  scaledSprintMinMps: number;
+  scaledSprintMaxMps: number;
+  scaledPassMaxMps: number;
+  scaledShotMaxMps: number;
+}
+
+export function getScaledPitchDimensions(
+  scaleFactor: number = EXPANDED_PITCH_SCALE.FACTOR
+): ScaledPitchDimensions {
+  const widthRatio = 90 / 140;
+  const lengthM = Number((PITCH.LENGTH * scaleFactor).toFixed(2));
+  const widthM = Number((lengthM * widthRatio).toFixed(2));
+  const factorY = widthM / PITCH.WIDTH;
+  return {
+    scaleFactor,
+    lengthM,
+    widthM,
+    penaltyAreaLengthM: Number((PITCH.PENALTY_AREA_X * scaleFactor).toFixed(2)),
+    penaltyAreaWidthM: Number((PITCH.PENALTY_AREA_HALF_Y * 2 * factorY).toFixed(2)),
+    sixYardLengthM: Number((PITCH.SIX_YARD_X * scaleFactor).toFixed(2)),
+    sixYardWidthM: Number((PITCH.SIX_YARD_HALF_Y * 2 * factorY).toFixed(2)),
+    centerCircleRadiusM: Number((PITCH.CENTER_CIRCLE_R * scaleFactor).toFixed(2)),
+    penaltySpotDistanceM: Number((PITCH.PENALTY_SPOT_X * scaleFactor).toFixed(2)),
+    goalWidthM: Number((PITCH.GOAL_WIDTH * scaleFactor).toFixed(2)),
+    goalHeightM: Number(PITCH.GOAL_HEIGHT.toFixed(2)),
+    scaledSprintMinMps: Number((PHYSICS_TUNING.SPRINT_SPEED_MIN_MPS * scaleFactor).toFixed(2)),
+    scaledSprintMaxMps: Number((PHYSICS_TUNING.SPRINT_SPEED_MAX_MPS * scaleFactor).toFixed(2)),
+    scaledPassMaxMps: Number((PHYSICS_TUNING.PASS_SPEED_MAX_MPS * scaleFactor).toFixed(2)),
+    scaledShotMaxMps: Number((PHYSICS_TUNING.SHOT_SPEED_MAX_MPS * scaleFactor).toFixed(2)),
+  };
+}
 
 export type StrikeType =
   | 'raso'
@@ -147,6 +230,20 @@ export interface MatchPlayerState {
   animState?: PlayerAnimState;
   lookTargetAngle?: number;
   aiRoleState?: string;
+  dribbleLooseTimer?: number;
+  // Racing Titanes Easter Egg properties
+  isRacingTitan?: boolean;
+  titanScale?: number;
+}
+
+export function getPlayerColliderRadius(p: MatchPlayerState): number {
+  if (p.isRacingTitan && isRacingTitansMasterFlagEnabled()) {
+    return (
+      RACING_TITANS_CONFIG.NORMAL_COLLIDER_RADIUS_M *
+      (p.titanScale ?? RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE)
+    );
+  }
+  return RACING_TITANS_CONFIG.NORMAL_COLLIDER_RADIUS_M;
 }
 
 /**
@@ -524,6 +621,18 @@ export function stepPlayerMovement(
   if (p.standingTackleTimer && p.standingTackleTimer > 0) {
     p.standingTackleTimer = Math.max(0, p.standingTackleTimer - dt);
   }
+  if (p.dribbleLooseTimer && p.dribbleLooseTimer > 0) {
+    p.dribbleLooseTimer = Math.max(0, p.dribbleLooseTimer - dt);
+  }
+
+  const isTitan = Boolean(p.isRacingTitan && isRacingTitansMasterFlagEnabled());
+  if (isTitan) {
+    p.stamina = 100;
+    p.injured = false;
+    p.stunTimer = 0;
+    p.fallTimer = 0;
+    p.dribbleLooseTimer = 0;
+  }
 
   if (p.slideTimer > 0) {
     p.slideTimer = Math.max(0, p.slideTimer - dt);
@@ -661,9 +770,13 @@ export function stepPlayerMovement(
   if (sharpCut || hardStop) {
     p.brakeTimer = 0.24;
   }
+  if (!isTitan && hasBall && inputMag > 0.15 && Math.abs(angleDiff) > 1.15 && currentSpeed > 4.6) {
+    p.dribbleLooseTimer = Math.max(p.dribbleLooseTimer ?? 0, 0.34);
+  }
 
-  // Velocity vector follows body facing with minimal turn drag so movement feels fast and fluid
-  const turnDrag = inputMag > 0.08 ? Math.max(0.84, 1 - Math.abs(angleDiff) * 0.10) : 1.0;
+  // Velocity vector follows body facing with natural turn inertia
+  const baseTurnPenalty = hasBall && Math.abs(angleDiff) > 1.05 ? 0.14 : 0.10;
+  const turnDrag = inputMag > 0.08 ? Math.max(0.78, 1 - Math.abs(angleDiff) * baseTurnPenalty) : 1.0;
   const moveDirX = Math.cos(p.facing) * 0.52 + dirX * 0.48;
   const moveDirY = Math.sin(p.facing) * 0.52 + dirY * 0.48;
   const moveNorm = Math.max(0.001, Math.hypot(moveDirX, moveDirY));
@@ -697,7 +810,10 @@ export function stepPlayerMovement(
 
   const newSpeed = Math.hypot(p.vx, p.vy);
   if (newSpeed > 0.15) {
-    p.stridePhase += (1.35 + newSpeed * 1.45) * dt;
+    const strideAnimSpeedScale = isTitan
+      ? RACING_TITANS_CONFIG.TITAN_ANIMATION_SPEED_SCALE
+      : 1.0;
+    p.stridePhase += (1.35 + newSpeed * 1.45) * strideAnimSpeedScale * dt;
   }
 
   // Foot Inverse Kinematics (Cinemática Inversa en los pies para apoyar firmemente en el césped)
@@ -770,7 +886,10 @@ export function stepPlayerMovement(
   }
 
   // High-endurance stamina system: players drain slowly only when sprinting and recover while jogging/walking
-  if (canSprint) {
+  if (isTitan) {
+    p.stamina = 100;
+    p.injured = false;
+  } else if (canSprint) {
     const drain = Math.max(0.16, 0.48 - staminaNorm * 0.26) * dt;
     p.stamina = Math.max(0, p.stamina - drain);
   } else if (newSpeed > 1.5) {
@@ -795,60 +914,90 @@ export interface CollisionResolutionSummary {
 
 /**
  * Physical player collisions with mass, inertia, shoving & shoulder-to-shoulder jostling (forcejeo).
+ * Scales collider radius for Racing Titans and enforces unstoppable shoving against normal opponents.
  */
 export function resolvePlayerCollisions(
   players: MatchPlayerState[],
   currentBallOwnerId: string | null = null,
   rng: () => number = Math.random
 ): CollisionResolutionSummary {
-  const minDist = 0.88;
   let hadHardBodyClash = false;
   let dispossessedCarrierId: string | null = null;
   let newOwnerId: string | null = null;
+  const masterTitanFlag = isRacingTitansMasterFlagEnabled();
 
   for (let i = 0; i < players.length; i++) {
     const a = players[i];
     if (a.redCard) continue;
+    const aIsTitan = Boolean(masterTitanFlag && a.isRacingTitan);
+    const radiusA = getPlayerColliderRadius(a);
     const buildMassBonusA =
       a.player.bodyBuild === 'robusto' ? 7 : a.player.bodyBuild === 'delgado' ? -5 : 0;
-    const massA =
-      65 +
-      ((a.player.heightCm ?? 178) - 165) * 0.55 +
-      a.player.attributes.strength * 0.22 +
-      buildMassBonusA;
+    const massA = aIsTitan
+      ? 2400
+      : 65 +
+        ((a.player.heightCm ?? 178) - 165) * 0.55 +
+        a.player.attributes.strength * 0.22 +
+        buildMassBonusA;
 
     for (let j = i + 1; j < players.length; j++) {
       const b = players[j];
       if (b.redCard) continue;
+      const bIsTitan = Boolean(masterTitanFlag && b.isRacingTitan);
+      const radiusB = getPlayerColliderRadius(b);
+      const pairMinDist = radiusA + radiusB;
+
       const dx = b.x - a.x;
       const dy = b.y - a.y;
       const distSq = dx * dx + dy * dy;
 
-      if (distSq < minDist * minDist && distSq > 0.0001) {
+      if (distSq < pairMinDist * pairMinDist && distSq > 0.0001) {
         const dist = Math.sqrt(distSq);
         const nx = dx / dist;
         const ny = dy / dist;
 
         const buildMassBonusB =
           b.player.bodyBuild === 'robusto' ? 7 : b.player.bodyBuild === 'delgado' ? -5 : 0;
-        const massB =
-          65 +
-          ((b.player.heightCm ?? 178) - 165) * 0.55 +
-          b.player.attributes.strength * 0.22 +
-          buildMassBonusB;
+        const massB = bIsTitan
+          ? 2400
+          : 65 +
+            ((b.player.heightCm ?? 178) - 165) * 0.55 +
+            b.player.attributes.strength * 0.22 +
+            buildMassBonusB;
         const totalMass = massA + massB;
-        const shareA = massB / totalMass;
-        const shareB = massA / totalMass;
+        const shareA = aIsTitan && !bIsTitan ? 0.01 : bIsTitan && !aIsTitan ? 0.99 : massB / totalMass;
+        const shareB = 1 - shareA;
 
-        const overlap = minDist - dist;
+        const overlap = (pairMinDist - dist) * 0.85;
         a.x -= nx * overlap * shareA;
         a.y -= ny * overlap * shareA;
         b.x += nx * overlap * shareB;
         b.y += ny * overlap * shareB;
 
         if (a.side !== b.side) {
-          a.jostleTimer = 0.25;
-          b.jostleTimer = 0.25;
+          a.jostleTimer = aIsTitan && !bIsTitan ? 0 : 0.25;
+          b.jostleTimer = bIsTitan && !aIsTitan ? 0 : 0.25;
+
+          // Unstoppable Titan shoves normal rivals away on contact
+          if (aIsTitan && !bIsTitan) {
+            const shoveSpeed = 5.6;
+            b.vx += nx * shoveSpeed;
+            b.vy += ny * shoveSpeed;
+            b.x += nx * 0.35;
+            b.y += ny * 0.35;
+            b.jostleTimer = 0.42;
+            b.stunTimer = Math.max(b.stunTimer, 0.28);
+            hadHardBodyClash = true;
+          } else if (bIsTitan && !aIsTitan) {
+            const shoveSpeed = 5.6;
+            a.vx -= nx * shoveSpeed;
+            a.vy -= ny * shoveSpeed;
+            a.x -= nx * 0.35;
+            a.y -= ny * 0.35;
+            a.jostleTimer = 0.42;
+            a.stunTimer = Math.max(a.stunTimer, 0.28);
+            hadHardBodyClash = true;
+          }
         }
 
         // Relative velocity along collision normal (physical impulse & shove)
@@ -856,12 +1005,12 @@ export function resolvePlayerCollisions(
         const rvy = b.vy - a.vy;
         const normalVel = rvx * nx + rvy * ny;
         if (normalVel < 0) {
-          const restitution = 0.28;
+          const restitution = 0.24;
           const impulse = -(1 + restitution) * normalVel;
-          a.vx -= nx * impulse * shareA * 0.65;
-          a.vy -= ny * impulse * shareA * 0.65;
-          b.vx += nx * impulse * shareB * 0.65;
-          b.vy += ny * impulse * shareB * 0.65;
+          a.vx -= nx * impulse * shareA * 0.58;
+          a.vy -= ny * impulse * shareA * 0.58;
+          b.vx += nx * impulse * shareB * 0.58;
+          b.vy += ny * impulse * shareB * 0.58;
 
           if (Math.abs(normalVel) > 2.4) {
             hadHardBodyClash = true;
@@ -874,41 +1023,60 @@ export function resolvePlayerCollisions(
             a.id === currentBallOwnerId ? a : b.id === currentBallOwnerId ? b : null;
           const defender = carrier === a ? b : carrier === b ? a : null;
 
-          if (
-            carrier &&
-            defender &&
-            defender.tackleCooldown <= 0 &&
-            defender.stunTimer <= 0
-          ) {
-            const defPower =
-              defender.player.attributes.strength * 0.48 +
-              defender.player.attributes.tackling * 0.52 +
-              (defender.stamina / 100) * 12;
-            const carBalance =
-              carrier.player.attributes.strength * 0.42 +
-              carrier.player.attributes.dribbling * 0.58 +
-              (carrier.stamina / 100) * 14;
+          if (carrier && defender) {
+            const carrierIsTitan = Boolean(masterTitanFlag && carrier.isRacingTitan);
+            const defenderIsTitan = Boolean(masterTitanFlag && defender.isRacingTitan);
 
-            const toCarrierX = carrier.x - defender.x;
-            const toCarrierY = carrier.y - defender.y;
-            const contactAngle = Math.atan2(toCarrierY, toCarrierX);
-            const angleDiff = Math.abs(
-              Math.atan2(
-                Math.sin(contactAngle - carrier.facing),
-                Math.cos(contactAngle - carrier.facing)
-              )
-            );
-            const isSideOrFront = angleDiff > 0.75;
+            // Racing Titans NEVER lose the ball in body clashes against normal players
+            if (carrierIsTitan && !defenderIsTitan) {
+              continue;
+            }
 
-            if (isSideOrFront) {
-              const winProb =
-                0.16 + Math.max(-0.1, Math.min(0.32, (defPower - carBalance) / 130));
-              if (rng() < winProb) {
-                dispossessedCarrierId = carrier.id;
-                newOwnerId = defender.id;
-                carrier.stunTimer = 0.38;
-                defender.tackleCooldown = 0.55;
-                hadHardBodyClash = true;
+            // Racing Titan colliding with a normal ball carrier strips the ball immediately
+            if (defenderIsTitan && !carrierIsTitan && defender.tackleCooldown <= 0) {
+              dispossessedCarrierId = carrier.id;
+              newOwnerId = defender.id;
+              carrier.stunTimer = 0.48;
+              defender.tackleCooldown = 0.25;
+              hadHardBodyClash = true;
+              continue;
+            }
+
+            if (defender.tackleCooldown <= 0 && defender.stunTimer <= 0) {
+              const defPower =
+                defender.player.attributes.strength * 0.48 +
+                defender.player.attributes.tackling * 0.52 +
+                (defender.stamina / 100) * 12;
+              const carBalance =
+                carrier.player.attributes.strength * 0.42 +
+                carrier.player.attributes.dribbling * 0.58 +
+                (carrier.stamina / 100) * 14;
+
+              const toCarrierX = carrier.x - defender.x;
+              const toCarrierY = carrier.y - defender.y;
+              const contactAngle = Math.atan2(toCarrierY, toCarrierX);
+              const angleDiff = Math.abs(
+                Math.atan2(
+                  Math.sin(contactAngle - carrier.facing),
+                  Math.cos(contactAngle - carrier.facing)
+                )
+              );
+              const isLooseTurn = (carrier.dribbleLooseTimer ?? 0) > 0;
+              const isSideOrFront = angleDiff > 0.72 || isLooseTurn;
+
+              if (isSideOrFront) {
+                const looseBonus = isLooseTurn ? 0.24 : 0;
+                const winProb =
+                  0.18 +
+                  looseBonus +
+                  Math.max(-0.1, Math.min(0.35, (defPower - carBalance) / 125));
+                if (rng() < winProb) {
+                  dispossessedCarrierId = carrier.id;
+                  newOwnerId = defender.id;
+                  carrier.stunTimer = 0.38;
+                  defender.tackleCooldown = 0.55;
+                  hadHardBodyClash = true;
+                }
               }
             }
           }

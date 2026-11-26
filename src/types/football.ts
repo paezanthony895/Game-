@@ -226,6 +226,8 @@ export interface GameSettings {
     weather: WeatherType;
     timeOfDay: TimeOfDay;
     pitchCondition: PitchCondition;
+    racingTitansUnlocked?: boolean;
+    racingTitansEnabled?: boolean;
   };
   visual: {
     quality: 'baja' | 'media' | 'alta' | 'ultra';

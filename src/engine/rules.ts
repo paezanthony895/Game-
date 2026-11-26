@@ -1,4 +1,9 @@
-import { PITCH, type BallState, type MatchPlayerState } from './physics';
+import {
+  PITCH,
+  isRacingTitansMasterFlagEnabled,
+  type BallState,
+  type MatchPlayerState,
+} from './physics';
 
 export type RestartType =
   | 'kickoff'
@@ -154,6 +159,24 @@ export function evaluateAerialDuel(
   ball: BallState,
   rng: () => number
 ): AerialDuelOutcome {
+  if (isRacingTitansMasterFlagEnabled()) {
+    if (playerA.isRacingTitan && !playerB.isRacingTitan) {
+      return {
+        winnerId: playerA.id,
+        loserId: playerB.id,
+        winMargin: 85,
+        isFoulPush: false,
+      };
+    }
+    if (playerB.isRacingTitan && !playerA.isRacingTitan) {
+      return {
+        winnerId: playerB.id,
+        loserId: playerA.id,
+        winMargin: 85,
+        isFoulPush: false,
+      };
+    }
+  }
   const heightA = (playerA.player.heightCm ?? 180) - 165;
   const heightB = (playerB.player.heightCm ?? 180) - 165;
 
@@ -220,6 +243,36 @@ export function evaluateTackleOutcome(
   rng: () => number,
   ball?: BallState
 ): TackleOutcome {
+  if (isRacingTitansMasterFlagEnabled()) {
+    // 1. Unstoppable Racing Titan carrier: never loses the ball in clashes or slide tackles against normal players,
+    // never gets knocked down, and never gets injured.
+    if (carrier.isRacingTitan && !tackler.isRacingTitan) {
+      return {
+        wonBall: false,
+        isFoul: false,
+        isPenalty: false,
+        card: 'none',
+        foulType: 'clean',
+        severity: 0,
+        knockdown: false,
+        injuryTriggered: false,
+      };
+    }
+    // 2. Racing Titan tackler against a normal carrier: cleanly dispossesses the normal player and pushes them off.
+    if (tackler.isRacingTitan && !carrier.isRacingTitan) {
+      return {
+        wonBall: true,
+        isFoul: false,
+        isPenalty: false,
+        card: 'none',
+        foulType: 'clean',
+        severity: 0.25,
+        knockdown: isSlide,
+        injuryTriggered: false,
+      };
+    }
+  }
+
   const tackleSkill = tackler.player.attributes.tackling / 100;
   const dribbleSkill = carrier.player.attributes.dribbling / 100;
   const tacklerStrength = tackler.player.attributes.strength / 100;

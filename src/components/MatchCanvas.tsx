@@ -24,6 +24,10 @@ import {
   ArrowLeftRight,
   Zap,
   Flag,
+  Cpu,
+  Sun,
+  Sunset,
+  Moon,
 } from 'lucide-react';
 import { FORMATIONS, getFormation } from '../data/formations';
 import { getGameModeConfig, resolveKitClash } from '../engine/gameModeManager';
@@ -32,6 +36,7 @@ import { TacticalFormationBoard } from './TacticalFormationBoard';
 import {
   MatchEngine,
   type FreeKickControlState,
+  type GoalKickAimState,
   type MatchCutsceneState,
   type MatchPhase,
   type OffsideCutsceneState,
@@ -56,6 +61,9 @@ import { Stadium3D } from './Stadium3D';
 import { TeamCoverBanner } from './TeamCoverBanner';
 import { TeamCrest } from './TeamCrest';
 import { TouchControls, type ChargeActionKind } from './TouchControls';
+import { sharedOnlineClient, type OnlineSnapshotData } from '../multiplayer/onlineClient';
+import { UnityUrpInspectorModal } from './UnityUrpInspectorModal';
+import type { MatchScene3DController } from '../engine/scene3d';
 
 type LiveMatchStats = MatchResultSummary['homeStats'];
 
@@ -78,6 +86,10 @@ interface MatchCanvasProps {
   initialHomeGoals?: number;
   initialAwayGoals?: number;
   trainingDrill?: 'free_play' | 'shooting' | 'passing' | 'dribbling' | 'free_kicks';
+  onlineSession?: {
+    roomCode: string;
+    side: 'home' | 'away';
+  };
   onMatchFinish: (summary: MatchResultSummary) => void;
   onExitMatch: () => void;
 }
@@ -117,12 +129,15 @@ interface HudSnapshot {
   activePlayer: ActivePlayerHudInfo | null;
   opponentPlayer: ActivePlayerHudInfo | null;
   freeKick: FreeKickControlState | null;
+  goalKickAim: GoalKickAimState | null;
   cardCutscene: RefereeCardCutsceneState | null;
   offsideCutscene: OffsideCutsceneState | null;
   cutsceneState: MatchCutsceneState | null;
   lastSkillMove: { label: string; type: string; timer: number } | null;
   varReview: VARReviewState | null;
   lightningPlayerName: string | null;
+  racingTitansActive: boolean;
+  racingTitansBannerVisible: boolean;
   homeStats: LiveMatchStats;
   awayStats: LiveMatchStats;
   radarPlayers: { id: string; side: 'home' | 'away'; x: number; y: number; active: boolean; calling?: boolean }[];
@@ -192,12 +207,16 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
   initialHomeGoals,
   initialAwayGoals,
   trainingDrill,
+  onlineSession,
   onMatchFinish,
   onExitMatch,
 }) => {
   const stageContainerRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<MatchEngine | null>(null);
   const lastHudSigRef = useRef('');
+  const lastOnlineSyncRef = useRef(0);
+  const latestOnlineSnapshotRef = useRef<OnlineSnapshotData | null>(null);
+  const [onlineOpponentAlert, setOnlineOpponentAlert] = useState<string | null>(null);
   const pausedRef = useRef(false);
   const finishedSentRef = useRef(false);
   const keysHeldRef = useRef<Set<string>>(new Set());
@@ -219,6 +238,11 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
   const [liveQuality, setLiveQuality] = useState<GameSettings['visual']['quality']>(
     settings.visual.quality ?? 'alta'
   );
+  const [liveTimeOfDay, setLiveTimeOfDay] = useState<GameSettings['match']['timeOfDay']>(
+    settings.match.timeOfDay ?? 'noche'
+  );
+  const [showUnityInspector, setShowUnityInspector] = useState<boolean>(false);
+  const sceneControllerOutRef = useRef<MatchScene3DController | null>(null);
   const [soundMuted, setSoundMuted] = useState<boolean>(settings.audio.masterMuted);
   const [showSubsModal, setShowSubsModal] = useState(false);
   const [showTacticsMenu, setShowTacticsMenu] = useState(false);
@@ -308,12 +332,15 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
     activePlayer: null,
     opponentPlayer: null,
     freeKick: null,
+    goalKickAim: null,
     cardCutscene: null,
     offsideCutscene: null,
     cutsceneState: null,
     lastSkillMove: null,
     varReview: null,
     lightningPlayerName: null,
+    racingTitansActive: false,
+    racingTitansBannerVisible: false,
     homeStats: { ...EMPTY_STATS },
     awayStats: { ...EMPTY_STATS },
     radarPlayers: [],
@@ -336,6 +363,12 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
   const startChargeAction = (action: ChargeActionKind) => {
     const eng = engineRef.current;
     if (!eng || pausedRef.current) return;
+    if (eng.phase === 'GOAL_KICK_AIM' && action === 'pass') {
+      triggerHaptic(14);
+      soundEngine.playKickWithPower(0.55);
+      eng.userInput.passPressed = true;
+      return;
+    }
     chargeHoldRef.current = { action, startTime: performance.now() };
     triggerHaptic(action === 'shoot' ? 15 : 10);
     if (action === 'shoot') {
@@ -346,6 +379,11 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
   const releaseChargeAction = (action: ChargeActionKind) => {
     const eng = engineRef.current;
     if (!eng) return;
+    if (eng.phase === 'GOAL_KICK_AIM' && action === 'pass') {
+      chargeHoldRef.current = null;
+      eng.userInput.passPressed = true;
+      return;
+    }
     const current = chargeHoldRef.current;
     const heldMs = current && current.action === action ? performance.now() - current.startTime : 180;
     const power = Math.max(0.32, Math.min(1, heldMs / 460));
@@ -377,6 +415,12 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
   const startChargeAction2 = (action: ChargeActionKind) => {
     const eng = engineRef.current;
     if (!eng || pausedRef.current) return;
+    if (eng.phase === 'GOAL_KICK_AIM' && action === 'pass') {
+      triggerHaptic(14);
+      soundEngine.playKickWithPower(0.55);
+      eng.userInput2.passPressed = true;
+      return;
+    }
     chargeHold2Ref.current = { action, startTime: performance.now() };
     triggerHaptic(action === 'shoot' ? 15 : 10);
     if (action === 'shoot') {
@@ -490,8 +534,8 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       mode,
       homeTeam,
       awayTeam,
-      userSide,
-      twoPlayerMode,
+      userSide: onlineSession ? (onlineSession.side === 'home' ? 'home' : 'away') : userSide,
+      twoPlayerMode: onlineSession ? onlineSession.side === 'home' : twoPlayerMode,
       settings,
       startMinute,
       initialHomeGoals,
@@ -507,6 +551,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       },
       onCommentary: (ctx) => commentaryEngine.trigger(ctx),
     });
+    (window as unknown as { __atlasMatchEngine?: MatchEngine }).__atlasMatchEngine = engineRef.current;
   };
 
   useEffect(() => {
@@ -514,13 +559,53 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
     if (twoPlayerMode) {
       setShowTouchOverlay(true);
     }
+    if (onlineSession) {
+      sharedOnlineClient.setListeners({
+        onRemoteGuestInput: (remoteInput) => {
+          const eng = engineRef.current;
+          if (!eng || onlineSession.side !== 'home') return;
+          eng.userInput2.moveX = remoteInput.moveX;
+          eng.userInput2.moveY = remoteInput.moveY;
+          eng.userInput2.sprint = remoteInput.sprint;
+          eng.userInput2.pressHeld = remoteInput.pressHeld;
+          if (remoteInput.passPressed) {
+            eng.userInput2.passPressed = true;
+            eng.userInput2.passPower = remoteInput.passPower;
+          }
+          if (remoteInput.throughPressed) {
+            eng.userInput2.throughPressed = true;
+            eng.userInput2.throughPower = remoteInput.throughPower;
+          }
+          if (remoteInput.shootReleased) {
+            eng.userInput2.shootReleased = true;
+            eng.userInput2.shootPower = remoteInput.shootPower;
+          }
+          if (remoteInput.crossPressed) {
+            eng.userInput2.crossPressed = true;
+            eng.userInput2.crossPower = remoteInput.crossPower;
+          }
+          if (remoteInput.tacklePressed) eng.userInput2.tacklePressed = true;
+          if (remoteInput.slidePressed) eng.userInput2.slidePressed = true;
+          if (remoteInput.switchPressed) eng.userInput2.switchPressed = true;
+          if (remoteInput.skillMovePressed) eng.userInput2.skillMovePressed = true;
+        },
+        onMatchSnapshot: (snap) => {
+          if (onlineSession.side === 'away') {
+            latestOnlineSnapshotRef.current = snap;
+          }
+        },
+        onOpponentStatus: (status, message) => {
+          setOnlineOpponentAlert(status === 'reconnected' ? null : message);
+        },
+      });
+    }
     return () => {
       document.body.dataset.state = 'title';
       commentaryEngine.stop();
       soundEngine.stopMatchAmbience();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, homeTeam.id, awayTeam.id, userSide, twoPlayerMode]);
+  }, [mode, homeTeam.id, awayTeam.id, userSide, twoPlayerMode, onlineSession?.roomCode]);
 
   // Keyboard & blur listeners (with hold-to-charge power meter on Pass, Through, Cross, and Shoot)
   useEffect(() => {
@@ -693,7 +778,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         touchStickRef.current.sprint ||
         touchSprintBtnRef.current;
 
-      if (eng.twoPlayerMode) {
+      if (eng.twoPlayerMode && !onlineSession) {
         let kx2 = 0;
         let ky2 = 0;
         if (keys.has('ArrowUp')) ky2 -= 1;
@@ -711,7 +796,23 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           touchSprintBtn2Ref.current;
       }
 
-      eng.step(rawDt);
+      if (onlineSession && onlineSession.side === 'away') {
+        // Guest (Away) sends local input at ~30Hz and smoothly interpolates authoritative state from Host
+        if (now - lastOnlineSyncRef.current >= 28 || eng.userInput.passPressed || eng.userInput.shootReleased || eng.userInput.throughPressed || eng.userInput.crossPressed || eng.userInput.tacklePressed || eng.userInput.slidePressed || eng.userInput.switchPressed || eng.userInput.skillMovePressed) {
+          lastOnlineSyncRef.current = now;
+          sharedOnlineClient.sendGuestInput({ ...eng.userInput });
+        }
+        eng.step(rawDt * 0.35);
+        if (latestOnlineSnapshotRef.current) {
+          eng.applyOnlineSnapshot(latestOnlineSnapshotRef.current, 0.46);
+        }
+      } else {
+        eng.step(rawDt);
+        if (onlineSession && onlineSession.side === 'home' && now - lastOnlineSyncRef.current >= 32) {
+          lastOnlineSyncRef.current = now;
+          sharedOnlineClient.sendHostSnapshot(eng.serializeOnlineSnapshot());
+        }
+      }
 
       // Update dynamic stadium ambience volume, crowd chants & rival whistles
       const boxDanger = Math.max(0, (Math.abs(eng.ball.x - PITCH.HALF_X) - 18) / 34);
@@ -721,16 +822,24 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         eng.ball.lastTouchTeam !== (userSide === 'away' ? 'away' : 'home');
       soundEngine.updateMatchAmbience(
         boxDanger,
-        eng.phase === 'live' || eng.phase === 'set_piece',
+        eng.phase === 'live' || eng.phase === 'set_piece' || eng.phase === 'GOAL_KICK_AIM',
         rivalHasBall
       );
     } else {
       soundEngine.updateMatchAmbience(0, false, false);
     }
 
-    return chargeHoldRef.current !== null
-      ? Math.max(0.15, Math.min(1, (now - chargeHoldRef.current.startTime) / 460))
-      : 0;
+    const activeChargePct =
+      chargeHoldRef.current !== null
+        ? Math.max(0.15, Math.min(1, (now - chargeHoldRef.current.startTime) / 460))
+        : 0;
+
+    if (eng.phase === 'GOAL_KICK_AIM' && eng.goalKickAimState && chargeHoldRef.current?.action === 'shoot') {
+      eng.goalKickAimState.isChargingShoot = true;
+      eng.goalKickAimState.chargePower = activeChargePct;
+    }
+
+    return activeChargePct;
   };
 
   const handleAfterEngineRender = (eng: MatchEngine, shootChargePct: number, now: number) => {
@@ -784,8 +893,12 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       ? `${eng.varReviewState.scenario}:${eng.varReviewState.phase}:${eng.varReviewState.cameraAngleIndex}`
       : '';
     const lightningActive = eng.lightningState?.active ? eng.lightningState.targetPlayerName : null;
+    const gkAimSig = eng.goalKickAimState
+      ? `${eng.goalKickAimState.team}:${eng.goalKickAimState.isUserControlled}:${Math.round(eng.goalKickAimState.aimAngleRad * 25)}:${Math.round(eng.goalKickAimState.elevationSlider * 25)}:${Math.round(eng.goalKickAimState.chargePower * 20)}`
+      : '';
+    const racingTitansBannerVisible = eng.hasActiveRacingTitans && eng.racingTitansBannerTimer > 0;
 
-    const sig = `${mInt}|${Math.floor(sInt / 2)}|${eng.homeScore}|${eng.awayScore}|${eng.phase}|${eng.bannerText}|${userHasBall}|${user2HasBall}|${userTactic}|${userFormation}|${subsUsed}|${isCharging}|${activeChargeKind}|${chargeStep}|${isCharging2}|${activeChargeKind2}|${chargeStep2}|${radarTick}|${activeP?.id ?? ''}|${opponentP?.id ?? ''}|${activeStamStep}|${advActive}|${fkActive}|${cardActive}|${offsideActive}|${cutsceneKey}|${skillMoveKey}|${varPhase}|${lightningActive}|${eng.replayCameraAngle}|${eng.penaltyState?.homeTaken ?? 0}|${eng.penaltyState?.awayTaken ?? 0}|${eng.penaltyState?.awaitingUserInput ?? false}`;
+    const sig = `${mInt}|${Math.floor(sInt / 2)}|${eng.homeScore}|${eng.awayScore}|${eng.phase}|${eng.bannerText}|${userHasBall}|${user2HasBall}|${userTactic}|${userFormation}|${subsUsed}|${isCharging}|${activeChargeKind}|${chargeStep}|${isCharging2}|${activeChargeKind2}|${chargeStep2}|${radarTick}|${activeP?.id ?? ''}|${opponentP?.id ?? ''}|${activeStamStep}|${advActive}|${fkActive}|${gkAimSig}|${cardActive}|${offsideActive}|${cutsceneKey}|${skillMoveKey}|${varPhase}|${lightningActive}|${eng.hasActiveRacingTitans}|${racingTitansBannerVisible}|${eng.replayCameraAngle}|${eng.penaltyState?.homeTaken ?? 0}|${eng.penaltyState?.awayTaken ?? 0}|${eng.penaltyState?.awaitingUserInput ?? false}`;
 
     if (sig !== lastHudSigRef.current) {
       lastHudSigRef.current = sig;
@@ -827,6 +940,8 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           : null,
         varReview: eng.varReviewState?.active ? { ...eng.varReviewState } : null,
         lightningPlayerName: lightningActive,
+        racingTitansActive: eng.hasActiveRacingTitans,
+        racingTitansBannerVisible,
         homeStats: { ...eng.homeStats },
         awayStats: { ...eng.awayStats },
         activePlayer: activeP
@@ -850,6 +965,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
             }
           : null,
         freeKick: eng.freeKickState ? { ...eng.freeKickState } : null,
+        goalKickAim: eng.goalKickAimState ? { ...eng.goalKickAimState } : null,
         radarPlayers: eng.players
           .filter((p) => !p.redCard && p.y > -5)
           .map((p) => ({
@@ -911,18 +1027,29 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
   const userFieldPlayers =
     engineRef.current?.players.filter((p) => p.side === userTeamSide && !p.redCard) ?? [];
 
-  // Merge live FPS limit and graphic quality override into settings passed to Stadium3D
+  // Merge live FPS limit, time of day, and graphic quality override into settings passed to Stadium3D
   const effectiveSettings = useMemo<GameSettings>(
     () => ({
       ...settings,
+      match: {
+        ...settings.match,
+        timeOfDay: liveTimeOfDay,
+      },
       visual: {
         ...settings.visual,
         fpsLimit: liveFpsLimit,
         quality: liveQuality,
       },
     }),
-    [settings, liveFpsLimit, liveQuality]
+    [settings, liveFpsLimit, liveQuality, liveTimeOfDay]
   );
+
+  const cycleTimeOfDay = () => {
+    const order: GameSettings['match']['timeOfDay'][] = ['dia', 'atardecer', 'noche'];
+    const next = order[(order.indexOf(liveTimeOfDay) + 1) % order.length];
+    setLiveTimeOfDay(next);
+    sceneControllerOutRef.current?.setTimeOfDay(next);
+  };
 
   // When a device is held vertically (portrait), rotate the entire match stage 90 degrees into true landscape!
   const isRotated90 = isViewportPortrait && forceRotatedLandscape;
@@ -950,6 +1077,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       <Stadium3D
         engineRef={engineRef}
         pausedRef={pausedRef}
+        sceneControllerOutRef={sceneControllerOutRef}
         homeTeam={homeTeam}
         awayTeam={awayTeam}
         homeKit={homeKit}
@@ -1114,6 +1242,43 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           >
             <Video className="w-3.5 h-3.5" />
             <span className="hidden xl:inline">{CAMERA_LABELS[activeCameraMode]}</span>
+          </button>
+
+          {/* Real-Time Day / Afternoon / Night Lighting Cycle Switcher (No Scene Reload) */}
+          <button
+            type="button"
+            data-testid="btn-cycle-time-of-day"
+            onClick={cycleTimeOfDay}
+            title="Selector de iluminación Día / Tarde / Noche sin recargar escena"
+            aria-label="Cambiar horario de iluminación"
+            className="flex items-center gap-1 bg-[#0B1117]/80 hover:bg-slate-800 border border-amber-400/35 rounded px-2 py-1 text-[11px] font-semibold text-amber-300 min-h-[30px] sm:min-h-[32px] cursor-pointer"
+          >
+            {liveTimeOfDay === 'dia' ? (
+              <Sun className="w-3.5 h-3.5" />
+            ) : liveTimeOfDay === 'atardecer' ? (
+              <Sunset className="w-3.5 h-3.5" />
+            ) : (
+              <Moon className="w-3.5 h-3.5" />
+            )}
+            <span className="hidden lg:inline uppercase">
+              {liveTimeOfDay === 'dia' ? 'Día' : liveTimeOfDay === 'atardecer' ? 'Tarde' : 'Noche'}
+            </span>
+          </button>
+
+          {/* Unity 2022 LTS URP 80K Stadium & 140x90m Engineering Inspector */}
+          <button
+            type="button"
+            data-testid="btn-match-unity-urp"
+            onClick={() => {
+              pausedRef.current = true;
+              setShowUnityInspector(true);
+            }}
+            title="Abrir Inspector de Ingeniería Unity 2022 LTS URP (140x90m · 80.000 espectadores)"
+            aria-label="Ingeniería Unity URP"
+            className="flex items-center gap-1 bg-cyan-950/85 hover:bg-cyan-900 border border-cyan-400/50 rounded px-2 py-1 text-[11px] font-extrabold text-cyan-200 min-h-[30px] sm:min-h-[32px] cursor-pointer"
+          >
+            <Cpu className="w-3.5 h-3.5 text-cyan-300" />
+            <span className="hidden xl:inline">URP 80K</span>
           </button>
 
           {/* Instant 3D Replay Trigger */}
@@ -1470,6 +1635,20 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         </div>
       )}
 
+      {/* Racing Titanes Easter Egg Kickoff Notice Banner */}
+      {hud.racingTitansBannerVisible && (
+        <div
+          data-testid="racing-titans-banner"
+          className="pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 rounded-2xl bg-gradient-to-r from-sky-900/95 via-slate-950/95 to-sky-900/95 border-2 border-sky-300 px-5 py-2.5 text-sm sm:text-base font-display font-black tracking-wider text-sky-100 shadow-2xl"
+        >
+          <Sparkles className="w-5 h-5 text-sky-300" />
+          <span>¡Racing Titanes activado!</span>
+          <span className="rounded bg-sky-400/20 border border-sky-300/50 px-2 py-0.5 text-[10px] font-mono-tabular text-sky-200">
+            3.5x GIGANTES · 100 OVR
+          </span>
+        </div>
+      )}
+
       {/* Referee Advantage Rule Indicator (Ley de Ventaja) */}
       {hud.advantageActive && (
         <div
@@ -1735,6 +1914,38 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         </div>
       )}
 
+      {/* Online Multiplayer Room & Disconnection Alert Banner */}
+      {onlineSession && (
+        <div
+          data-testid="online-match-badge"
+          className="pointer-events-none absolute top-2.5 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 rounded-full bg-slate-950/90 border border-cyan-400/45 px-3 py-1 text-[10px] font-black uppercase tracking-wider text-cyan-300 shadow-lg"
+        >
+          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+          <span>
+            ONLINE · SALA {onlineSession.roomCode} ({onlineSession.side === 'home' ? 'LOCAL' : 'VISITANTE'})
+          </span>
+        </div>
+      )}
+
+      {onlineOpponentAlert && (
+        <div
+          data-testid="online-opponent-alert"
+          className="pointer-events-auto absolute top-20 left-1/2 -translate-x-1/2 z-30 rounded-xl bg-rose-950/95 border border-rose-500/60 px-4 py-2 text-xs font-black text-rose-100 shadow-2xl flex items-center gap-3"
+        >
+          <span>{onlineOpponentAlert}</span>
+          <button
+            type="button"
+            onClick={() => {
+              sharedOnlineClient.leaveRoom();
+              onExitMatch();
+            }}
+            className="px-2.5 py-1 rounded bg-rose-500 text-slate-950 text-[10px] font-black uppercase cursor-pointer"
+          >
+            Salir al Menú
+          </button>
+        </div>
+      )}
+
       {/* Live Broadcast Dual-Voice Commentary Ticker + Crowd Chant Banner */}
       {liveSubtitle && (
         <div
@@ -1765,6 +1976,169 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
               🔥 <span>Tribuna: &ldquo;{liveSubtitle.crowdChantText}&rdquo;</span>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Interactive Goal Kick / Goalkeeper Clearance Aim HUD (GOAL_KICK_AIM) */}
+      {hud.phase === 'GOAL_KICK_AIM' && hud.goalKickAim?.isUserControlled && (
+        <div
+          data-testid="goal-kick-aim-hud"
+          className="pointer-events-auto absolute bottom-[96px] sm:bottom-[114px] left-1/2 -translate-x-1/2 z-30 flex items-stretch gap-2.5 rounded-xl bg-[#0B1117]/95 border border-[#D9F938]/55 px-3 py-2.5 shadow-2xl text-xs max-w-[92vw]"
+        >
+          {/* Left Column: Goal Kick Direction, Status & Visible Power Charge Bar */}
+          <div className="flex flex-col justify-between min-w-[205px] sm:min-w-[245px] space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-display text-xs sm:text-sm font-black uppercase tracking-wider text-[#D9F938] flex items-center gap-1.5">
+                <Target className="w-3.5 h-3.5" />
+                {hud.goalKickAim.isFromHands
+                  ? `SAQUE DE ARQUERO · ${hud.goalKickAim.keeperName}`
+                  : `SAQUE DE META · ${hud.goalKickAim.keeperName}`}
+              </span>
+              <span className="rounded bg-emerald-500/20 border border-emerald-400/40 px-1.5 py-0.5 text-[10px] font-mono-tabular font-bold text-emerald-300">
+                {Math.round((hud.goalKickAim.aimAngleRad * 180) / Math.PI)}°
+              </span>
+            </div>
+
+            {/* Horizontal Direction Quick Steer & Trajectory Type Readout */}
+            <div className="flex items-center justify-between gap-1.5 text-[11px] text-slate-300">
+              <span>
+                Trayectoria:{' '}
+                <strong className="text-white">
+                  {hud.goalKickAim.elevationSlider < 0.28
+                    ? 'Pase Raso y Corto'
+                    : hud.goalKickAim.elevationSlider < 0.65
+                    ? 'Envío Medio'
+                    : 'Pelotazo Largo'}
+                </strong>
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  aria-label="Apuntar saque a la izquierda"
+                  data-testid="btn-gk-aim-left"
+                  onClick={() => {
+                    engineRef.current?.adjustGoalKickAimAngle(-0.18);
+                  }}
+                  className="rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 px-2 py-0.5 text-[10px] font-bold text-white cursor-pointer"
+                >
+                  ◀ Izq
+                </button>
+                <button
+                  type="button"
+                  aria-label="Apuntar saque a la derecha"
+                  data-testid="btn-gk-aim-right"
+                  onClick={() => {
+                    engineRef.current?.adjustGoalKickAimAngle(0.18);
+                  }}
+                  className="rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 px-2 py-0.5 text-[10px] font-bold text-white cursor-pointer"
+                >
+                  Der ▶
+                </button>
+              </div>
+            </div>
+
+            {/* Visible Power Charge Bar for Botón TIRO */}
+            <div data-testid="goal-kick-power-bar" className="space-y-1">
+              <div className="flex items-center justify-between text-[10px] font-display font-black tracking-wider">
+                <span className="text-slate-300">
+                  {hud.shootCharging || hud.goalKickAim.isChargingShoot
+                    ? 'CARGANDO POTENCIA (SUELTA TIRO)...'
+                    : 'POTENCIA DE SAQUE (MANTÉN TIRO)'}
+                </span>
+                <span className="font-mono-tabular text-[#D9F938]">
+                  {Math.round(
+                    Math.max(
+                      hud.shootCharging ? hud.shootPower : 0,
+                      hud.goalKickAim.chargePower
+                    ) * 100
+                  )}
+                  %
+                </span>
+              </div>
+              <div className="w-full h-2.5 rounded-full bg-slate-800 overflow-hidden border border-white/20">
+                <div
+                  style={{
+                    width: `${Math.round(
+                      Math.max(
+                        hud.shootCharging ? hud.shootPower : 0,
+                        hud.goalKickAim.chargePower
+                      ) * 100
+                    )}%`,
+                  }}
+                  className={`h-full transition-none ${
+                    Math.max(hud.shootPower, hud.goalKickAim.chargePower) > 0.82
+                      ? 'bg-rose-500'
+                      : Math.max(hud.shootPower, hud.goalKickAim.chargePower) > 0.5
+                      ? 'bg-amber-400'
+                      : 'bg-emerald-400'
+                  }`}
+                />
+              </div>
+            </div>
+
+            <div className="text-[10px] text-slate-400 leading-tight">
+              Joystick Izq: Dirección · Mantén <strong className="text-rose-400">TIRO</strong>: Cargar y Patear ·{' '}
+              <strong className="text-emerald-400">PASAR</strong>: Saque Corto al Defensa
+            </div>
+          </div>
+
+          {/* Right Column: Vertical Slider / Vertical Drag Control for Height & Power */}
+          <div className="flex flex-col items-center justify-between border-l border-white/15 pl-2.5 select-none">
+            <span className="text-[9px] font-display font-black uppercase tracking-wider text-amber-300">
+              Largo ▲
+            </span>
+            <div
+              role="slider"
+              tabIndex={0}
+              aria-label="Altura y potencia del saque de meta"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(hud.goalKickAim.elevationSlider * 100)}
+              data-testid="goal-kick-elevation-slider"
+              onPointerDown={(e) => {
+                e.currentTarget.setPointerCapture(e.pointerId);
+                const rect = e.currentTarget.getBoundingClientRect();
+                const ratio = isRotated90
+                  ? (e.clientX - rect.left) / Math.max(1, rect.width)
+                  : 1 - (e.clientY - rect.top) / Math.max(1, rect.height);
+                const clamped = Math.max(0, Math.min(1, ratio));
+                engineRef.current?.setGoalKickElevationSlider(clamped);
+                setHud((prev) =>
+                  prev.goalKickAim
+                    ? { ...prev, goalKickAim: { ...prev.goalKickAim, elevationSlider: clamped } }
+                    : prev
+                );
+              }}
+              onPointerMove={(e) => {
+                if (e.buttons !== 1 && e.pointerType === 'mouse') return;
+                if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const ratio = isRotated90
+                  ? (e.clientX - rect.left) / Math.max(1, rect.width)
+                  : 1 - (e.clientY - rect.top) / Math.max(1, rect.height);
+                const clamped = Math.max(0, Math.min(1, ratio));
+                engineRef.current?.setGoalKickElevationSlider(clamped);
+                setHud((prev) =>
+                  prev.goalKickAim
+                    ? { ...prev, goalKickAim: { ...prev.goalKickAim, elevationSlider: clamped } }
+                    : prev
+                );
+              }}
+              className="relative w-7 h-20 sm:h-24 my-1 rounded-full bg-slate-900 border border-white/25 cursor-ns-resize flex items-end overflow-hidden touch-none"
+            >
+              <div
+                style={{ height: `${Math.round(hud.goalKickAim.elevationSlider * 100)}%` }}
+                className="w-full bg-gradient-to-t from-emerald-500 via-amber-400 to-rose-500 transition-none"
+              />
+              <div
+                style={{ bottom: `calc(${Math.round(hud.goalKickAim.elevationSlider * 100)}% - 6px)` }}
+                className="absolute left-0.5 right-0.5 h-3 rounded-full bg-white shadow border border-slate-950 pointer-events-none"
+              />
+            </div>
+            <span className="text-[9px] font-display font-black uppercase tracking-wider text-emerald-300">
+              Raso ▼
+            </span>
+          </div>
         </div>
       )}
 
@@ -3129,6 +3503,24 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
             </div>
           </div>
         </div>
+      )}
+      {showUnityInspector && (
+        <UnityUrpInspectorModal
+          onClose={() => {
+            setShowUnityInspector(false);
+            if (!isPaused) {
+              pausedRef.current = false;
+            }
+          }}
+          telemetry={sceneControllerOutRef.current?.getPerformanceTelemetry() ?? null}
+          currentTimeOfDay={liveTimeOfDay}
+          currentQuality={liveQuality}
+          onChangeTimeOfDay={(tod) => {
+            setLiveTimeOfDay(tod);
+            sceneControllerOutRef.current?.setTimeOfDay(tod);
+          }}
+          onChangeQuality={(q) => setLiveQuality(q)}
+        />
       )}
     </div>
   );

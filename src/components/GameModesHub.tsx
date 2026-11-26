@@ -53,6 +53,10 @@ export interface LaunchMatchRequest {
   initialAwayGoals?: number;
   trainingDrill?: 'free_play' | 'shooting' | 'passing' | 'dribbling' | 'free_kicks';
   competitionFixtureId?: string;
+  onlineSession?: {
+    roomCode: string;
+    side: 'home' | 'away';
+  };
 }
 
 interface GameModesHubProps {

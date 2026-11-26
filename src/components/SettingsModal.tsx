@@ -2,6 +2,10 @@ import React, { useState } from 'react';
 import { Sliders, Monitor, Volume2, Gamepad2, User, RotateCcw, Flame } from 'lucide-react';
 import { DIFFICULTY_CONFIG_TABLE } from '../engine/ai';
 import {
+  RACING_TITANS_CONFIG,
+  isRacingTitansMasterFlagEnabled,
+} from '../engine/racingTitansEasterEgg';
+import {
   DIFFICULTY_LABELS,
   type DifficultyLevel,
   type GameSettings,
@@ -238,6 +242,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </label>
             ))}
           </div>
+
+          {isRacingTitansMasterFlagEnabled() && (
+            <div className="md:col-span-2 mt-2 rounded-xl border border-sky-500/40 bg-gradient-to-r from-sky-950/60 via-slate-950 to-sky-950/40 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Flame className="w-4 h-4 text-sky-400" />
+                  <span className="font-display text-sm font-extrabold uppercase tracking-wider text-sky-300">
+                    Huevo de Pascua: Racing Titanes ({RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE}x Gigantes)
+                  </span>
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${
+                      settings.match.racingTitansUnlocked
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                    }`}
+                  >
+                    {settings.match.racingTitansUnlocked ? 'Desbloqueado' : 'Secreto (Toca 7 veces el escudo de Racing)'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-300">
+                  Cuando Racing Club juega (tuyo o rival), sus 11 jugadores miden {RACING_TITANS_CONFIG.TITAN_HEIGHT_SCALE}x, tienen todos los atributos en 100, IA Suprema sin errores, inmunidad a barridas y pisadas sísmicas.
+                </p>
+              </div>
+              <label
+                data-testid="toggle-racing-titans"
+                className="inline-flex items-center gap-2.5 rounded-lg bg-slate-900/90 border border-sky-500/40 px-3.5 py-2 text-xs font-bold text-sky-200 cursor-pointer shrink-0 hover:border-sky-400"
+              >
+                <input
+                  type="checkbox"
+                  checked={Boolean(settings.match.racingTitansEnabled)}
+                  onChange={(e) => {
+                    const enabled = e.target.checked;
+                    onChange({
+                      ...settings,
+                      match: {
+                        ...settings.match,
+                        racingTitansUnlocked: settings.match.racingTitansUnlocked || enabled,
+                        racingTitansEnabled: enabled,
+                      },
+                    });
+                  }}
+                  className="w-4 h-4 accent-sky-400"
+                />
+                <span>{settings.match.racingTitansEnabled ? 'Activado' : 'Activar Racing Titanes'}</span>
+              </label>
+            </div>
+          )}
         </div>
       )}
 
